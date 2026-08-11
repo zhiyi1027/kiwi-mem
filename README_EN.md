@@ -86,6 +86,8 @@ The first-person contract governs the assistant's internal semantic memories onl
 
 The admin UI and its data-bearing APIs use a separate Bearer secret. The server verifies only its `KIWI_ADMIN_TOKEN_SHA256` digest and the browser keeps the original secret in the current tab. Docker still binds to `127.0.0.1` by default; authentication is a second layer, not a substitute for a private network boundary.
 
+The entire service should still stay on a private network or Tailscale. Authentication narrows access but does not make a verbatim transcript archive suitable for direct public exposure.
+
 ---
 
 ## Who is it for

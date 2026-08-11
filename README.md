@@ -187,7 +187,7 @@ KIWI_ADMIN_TOKEN_SHA256=<64位摘要>
 MEMORY_CLIENT_KEY_DIGESTS_JSON={"codex_vps2":"<64位摘要>","cc_vps1":"<64位摘要>"}
 ```
 
-> 🔐 `/memory/v1/*`、`/v1/chat/completions` 和两个 MCP 入口使用各入口自己的 Bearer 密钥；管理面、调试、Dream、日历和同步接口使用独立管理密钥。服务端均只保存 SHA-256 摘要。认证不能替代网络隔离：开启完整聊天归档后仍不要把服务直接暴露在公网。Docker Compose 默认只绑定 `127.0.0.1`；跨机访问时将 `KIWI_BIND_IP` 设为私网/Tailscale IP。
+> 🔐 `/memory/v1/*`、`/v1/chat/completions` 和两个 MCP 入口使用各入口自己的 Bearer 密钥；管理面、调试、Dream、日历和同步接口使用独立管理密钥。服务端均只保存 SHA-256 摘要。认证不能替代网络隔离：整个服务仍应放在私网/Tailscale 中，开启完整聊天归档后绝不能把它直接暴露在公网。Docker Compose 默认只绑定 `127.0.0.1`；跨机访问时将 `KIWI_BIND_IP` 设为私网/Tailscale IP。
 
 保存后启动：
 ```bash
