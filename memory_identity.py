@@ -51,6 +51,10 @@ class MemoryClientConfigError(RuntimeError):
     pass
 
 
+class ArchiveIdentifierConfigError(RuntimeError):
+    pass
+
+
 def _configured_client_key_digests() -> dict[str, str]:
     raw = os.getenv("MEMORY_CLIENT_KEY_DIGESTS_JSON", "").strip()
     if not raw:
@@ -153,28 +157,49 @@ def contains_observer_user_label(text: str) -> bool:
     return any("用户" in segment for segment in _nontechnical_user_segments(text))
 
 
+ARCHIVE_ID_HMAC_KEY_ENV = "KIWI_ARCHIVE_ID_HMAC_KEY"
 _OPAQUE_ARCHIVE_PATTERNS = {
-    "conversation": re.compile(r"conv_[0-9a-f]{64}"),
-    "event": re.compile(r"evt_[0-9a-f]{64}"),
+    "conversation": re.compile(r"conv2_[0-9a-f]{64}"),
+    "event": re.compile(r"evt2_[0-9a-f]{64}"),
 }
 
 
-def opaque_archive_identifier(value: str, kind: str) -> str:
+def _archive_identifier_key() -> bytes:
+    key = os.getenv(ARCHIVE_ID_HMAC_KEY_ENV, "").encode("utf-8")
+    if len(key) < 32:
+        raise ArchiveIdentifierConfigError(
+            f"{ARCHIVE_ID_HMAC_KEY_ENV} must be a stable secret of at least 32 UTF-8 bytes"
+        )
+    return key
+
+
+def archive_identifier_key_fingerprint() -> str:
+    """Non-secret marker used to detect accidental HMAC-key rotation."""
+    return hashlib.sha256(b"kiwi-archive-id-key-v2\x00" + _archive_identifier_key()).hexdigest()
+
+
+def is_opaque_archive_identifier(value: str, kind: str) -> bool:
+    pattern = _OPAQUE_ARCHIVE_PATTERNS.get(kind)
+    return bool(pattern and pattern.fullmatch(str(value or "").strip()))
+
+
+def opaque_archive_identifier(value: str, kind: str, *, allow_precomputed: bool = False) -> str:
     """Map caller-controlled archive IDs to stable, identity-neutral IDs.
 
     Raw identifiers remain useful to callers for idempotency and conversation
-    grouping, but they may contain room or machine names.  Only this stable
-    digest is stored and returned.  Recognising an already opaque identifier
-    keeps backup restore idempotent.
+    grouping, but they may contain room or machine names.  A server-only HMAC
+    key prevents another authenticated door from guessing those labels offline.
+    Only the trusted admin backup path may preserve an already opaque ID.
     """
     clean = str(value or "").strip()
     if kind not in _OPAQUE_ARCHIVE_PATTERNS:
         raise ValueError("archive identifier kind must be conversation or event")
-    if _OPAQUE_ARCHIVE_PATTERNS[kind].fullmatch(clean):
+    if allow_precomputed and is_opaque_archive_identifier(clean, kind):
         return clean
-    prefix = "conv" if kind == "conversation" else "evt"
-    material = f"kiwi-archive-{kind}-v1\x00{clean}".encode("utf-8")
-    return f"{prefix}_{hashlib.sha256(material).hexdigest()}"
+    prefix = "conv2" if kind == "conversation" else "evt2"
+    material = f"kiwi-archive-{kind}-v2\x00{clean}".encode("utf-8")
+    digest = hmac.new(_archive_identifier_key(), material, hashlib.sha256).hexdigest()
+    return f"{prefix}_{digest}"
 
 
 def infer_memory_kind(content: str) -> str:

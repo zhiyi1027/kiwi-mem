@@ -30,7 +30,15 @@ import httpx
 import jieba
 import jieba.analyse
 
-from memory_identity import opaque_archive_identifier, prepare_generated_memory, prepare_scene_fields
+from memory_identity import (
+    ARCHIVE_ID_HMAC_KEY_ENV,
+    ArchiveIdentifierConfigError,
+    archive_identifier_key_fingerprint,
+    is_opaque_archive_identifier,
+    opaque_archive_identifier,
+    prepare_generated_memory,
+    prepare_scene_fields,
+)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 CANONICAL_ASSISTANT_ID = os.getenv("MEMORY_ASSISTANT_ID", "grey_knox").strip() or "grey_knox"
@@ -68,6 +76,7 @@ def _get_embedding_url() -> str:
 # ============================================================
 
 _pool: Optional[asyncpg.Pool] = None
+_ARCHIVE_KEY_FINGERPRINT_CONFIG = "archive_id_hmac_key_fingerprint"
 
 
 async def get_pool() -> asyncpg.Pool:
@@ -86,6 +95,43 @@ async def close_pool():
         await _pool.close()
         _pool = None
         print("✅ 数据库连接池已关闭")
+
+
+async def _ensure_archive_identifier_state(conn) -> None:
+    """Fail closed on legacy IDs or an accidentally changed archive HMAC key."""
+    legacy_count = await conn.fetchval("""
+        SELECT COUNT(*)
+        FROM memory_events
+        WHERE event_id !~ '^evt2_[0-9a-f]{64}$'
+           OR conversation_id !~ '^conv2_[0-9a-f]{64}$'
+    """)
+    if legacy_count:
+        raise ArchiveIdentifierConfigError(
+            f"{legacy_count} legacy archive events require migration or explicit removal before startup"
+        )
+
+    event_count = await conn.fetchval("SELECT COUNT(*) FROM memory_events")
+    key_is_configured = bool(os.getenv(ARCHIVE_ID_HMAC_KEY_ENV, "").encode("utf-8"))
+    if not key_is_configured and not event_count:
+        return
+
+    fingerprint = archive_identifier_key_fingerprint()
+    stored = await conn.fetchval(
+        "SELECT value FROM gateway_config WHERE key = $1",
+        _ARCHIVE_KEY_FINGERPRINT_CONFIG,
+    )
+    if stored and stored != fingerprint:
+        raise ArchiveIdentifierConfigError(
+            f"{ARCHIVE_ID_HMAC_KEY_ENV} changed; restore the original secret or migrate archive identifiers"
+        )
+    if not stored:
+        if event_count:
+            raise ArchiveIdentifierConfigError("archive identifier key fingerprint is missing for existing events")
+        await conn.execute("""
+            INSERT INTO gateway_config (key, value, label, updated_at)
+            VALUES ($1, $2, 'Internal archive HMAC key fingerprint', NOW())
+            ON CONFLICT (key) DO NOTHING
+        """, _ARCHIVE_KEY_FINGERPRINT_CONFIG, fingerprint)
 
 
 # ============================================================
@@ -717,6 +763,8 @@ async def init_tables():
             ON memory_events (memory_space_id, occurred_at DESC)
         """)
 
+        await _ensure_archive_identifier_state(conn)
+
         # v6.2：providers 表添加 api_format 列（openai / anthropic）
         has_api_format = await conn.fetchval("""
             SELECT EXISTS (
@@ -1244,10 +1292,12 @@ async def ingest_memory_event(
     metadata: dict | None = None,
     memory_space_id: str = CANONICAL_MEMORY_SPACE_ID,
     assistant_identity_id: str = CANONICAL_ASSISTANT_ID,
+    trusted_opaque_ids: bool = False,
 ) -> dict:
     """Append one raw event, idempotently, without modifying prior evidence."""
     pool = await get_pool()
     async with pool.acquire() as conn:
+        await _ensure_archive_identifier_state(conn)
         return await _ingest_memory_event_conn(
             conn,
             event_id=event_id,
@@ -1259,6 +1309,7 @@ async def ingest_memory_event(
             metadata=metadata,
             memory_space_id=memory_space_id,
             assistant_identity_id=assistant_identity_id,
+            trusted_opaque_ids=trusted_opaque_ids,
         )
 
 
@@ -1274,13 +1325,16 @@ async def _ingest_memory_event_conn(
     metadata: dict | None,
     memory_space_id: str,
     assistant_identity_id: str,
+    trusted_opaque_ids: bool = False,
 ) -> dict:
     """Insert one immutable event using an existing connection/transaction."""
     # Client IDs are idempotency/grouping inputs, not public identity labels.
     # Store only stable opaque forms so no room, account, or machine name can
     # surface through archive listings, cursors, handoff, or backups.
-    event_id = opaque_archive_identifier(event_id, "event")
-    conversation_id = opaque_archive_identifier(conversation_id, "conversation")
+    event_id = opaque_archive_identifier(event_id, "event", allow_precomputed=trusted_opaque_ids)
+    conversation_id = opaque_archive_identifier(
+        conversation_id, "conversation", allow_precomputed=trusted_opaque_ids
+    )
     row = await conn.fetchrow("""
             INSERT INTO memory_events (
                 event_id, memory_space_id, assistant_identity_id, source_client,
@@ -1324,6 +1378,7 @@ async def ingest_memory_events(
     source_client: str,
     memory_space_id: str = CANONICAL_MEMORY_SPACE_ID,
     assistant_identity_id: str = CANONICAL_ASSISTANT_ID,
+    trusted_opaque_ids: bool = False,
 ) -> list[dict]:
     """Atomically replay a batch of immutable events after a disconnect."""
     if not events:
@@ -1331,6 +1386,7 @@ async def ingest_memory_events(
     pool = await get_pool()
     results = []
     async with pool.acquire() as conn:
+        await _ensure_archive_identifier_state(conn)
         async with conn.transaction():
             for event in events:
                 results.append(await _ingest_memory_event_conn(
@@ -1344,6 +1400,7 @@ async def ingest_memory_events(
                     metadata=event.get("metadata"),
                     memory_space_id=memory_space_id,
                     assistant_identity_id=assistant_identity_id,
+                    trusted_opaque_ids=trusted_opaque_ids,
                 ))
     return results
 
@@ -1480,6 +1537,8 @@ async def get_memory_handoff(
         """, memory_space_id, current_conversation_id)
         if not source:
             return None
+        if not is_opaque_archive_identifier(source["conversation_id"], "conversation"):
+            raise ArchiveIdentifierConfigError("legacy archive conversation ids must be migrated before handoff")
         rows = await conn.fetch("""
             SELECT event_id, conversation_id, role, content, occurred_at
             FROM memory_events
@@ -1490,6 +1549,12 @@ async def get_memory_handoff(
             LIMIT $3
         """, memory_space_id, source["conversation_id"], safe_tail)
     messages = [dict(row) for row in reversed(rows)]
+    if any(
+        not is_opaque_archive_identifier(message.get("event_id"), "event")
+        or not is_opaque_archive_identifier(message.get("conversation_id"), "conversation")
+        for message in messages
+    ):
+        raise ArchiveIdentifierConfigError("legacy archive event ids must be migrated before handoff")
     return {
         "conversation_id": source["conversation_id"],
         "last_event_at": source["last_event_at"],

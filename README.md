@@ -185,6 +185,9 @@ KIWI_ADMIN_TOKEN_SHA256=<64位摘要>
 
 # 使用 /memory/v1/*、/v1/chat/completions 或 MCP 时必填：每扇入口原始密钥的 SHA-256 摘要
 MEMORY_CLIENT_KEY_DIGESTS_JSON={"codex_vps2":"<64位摘要>","cc_vps1":"<64位摘要>"}
+
+# 必填：稳定的归档编号 HMAC 原始密钥（至少 32 字节，只通过 VPS secret 注入）
+KIWI_ARCHIVE_ID_HMAC_KEY=<长随机原始密钥>
 ```
 
 > 🔐 `/memory/v1/*`、`/v1/chat/completions` 和两个 MCP 入口使用各入口自己的 Bearer 密钥；管理面、调试、Dream、日历和同步接口使用独立管理密钥。服务端均只保存 SHA-256 摘要。认证不能替代网络隔离：整个服务仍应放在私网/Tailscale 中，开启完整聊天归档后绝不能把它直接暴露在公网。Docker Compose 默认只绑定 `127.0.0.1`；跨机访问时将 `KIWI_BIND_IP` 设为私网/Tailscale IP。
@@ -424,6 +427,7 @@ https://你的域名/admin
 | `MEMORY_SPACE_ID` | 所有记忆入口共享的空间 ID | `zhizhi_grey` |
 | `MEMORY_CLIENT_KEY_DIGESTS_JSON` | 记忆 API、聊天网关与 MCP 共用的入口名→Bearer 密钥 SHA-256 摘要映射 | — |
 | `KIWI_ADMIN_TOKEN_SHA256` | 管理面 Bearer 密钥的 SHA-256 摘要 | — |
+| `KIWI_ARCHIVE_ID_HMAC_KEY` | 生成不可猜归档编号的稳定服务端秘密；不可随意轮换 | — |
 | `DEFAULT_MODEL` | 默认聊天模型 | `anthropic/claude-sonnet-4` |
 | `PORT` | 端口 | `8080` |
 | `MAX_MEMORIES_INJECT` | 每次注入最大记忆条数 | `15` |

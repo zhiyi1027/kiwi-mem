@@ -273,6 +273,7 @@ Memory import is being rebuilt and will return in a future version in a smarter 
 | `MEMORY_SPACE_ID` | Memory space shared by every memory door | `zhizhi_grey` |
 | `MEMORY_CLIENT_KEY_DIGESTS_JSON` | Door-to-Bearer SHA-256 digest map used by the memory API, chat gateway, and MCP | — |
 | `KIWI_ADMIN_TOKEN_SHA256` | SHA-256 digest of the admin Bearer secret | — |
+| `KIWI_ARCHIVE_ID_HMAC_KEY` | Stable server-only secret for unguessable archive IDs; do not rotate casually | — |
 | `DEFAULT_MODEL` | Default chat model | `anthropic/claude-sonnet-4` |
 | `PORT` | Gateway port | `8080` |
 | `MAX_MEMORIES_INJECT` | Max memories per injection | `15` |

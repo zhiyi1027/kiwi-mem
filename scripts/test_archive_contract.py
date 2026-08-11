@@ -64,13 +64,18 @@ def main() -> None:
             "server still accepts plaintext memory-client keys")
     require("MEMORY_CLIENT_KEY_DIGESTS_JSON" in identity_source,
             "memory-client digest configuration is missing")
+    require("KIWI_ARCHIVE_ID_HMAC_KEY" in identity_source and "hmac.new" in identity_source,
+            "archive identifiers are not keyed by a server-only secret")
     require("is_shared_identity_entry_path" in main_source,
             "chat/MCP transports lost memory-client authentication")
 
     require("${KIWI_BIND_IP:-127.0.0.1}" in compose, "Docker no longer binds privately by default")
+    require("KIWI_ARCHIVE_ID_HMAC_KEY" in compose, "Docker does not inject the archive HMAC secret")
     require('"chat_archive_enabled"' in config_source and '"false"' in config_source, "verbatim archive is not explicit opt-in")
     require("_archive_gateway_user(" in main_source and "_archive_gateway_assistant(" in main_source,
             "gateway stopped capturing both visible sides")
+    require("archive_manifest.json" in main_source and "key_fingerprint" in main_source,
+            "backup restore no longer verifies the archive HMAC key")
 
     print("PASS: private complete-transcript archive contract")
 

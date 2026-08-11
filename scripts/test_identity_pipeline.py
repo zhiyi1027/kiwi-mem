@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -14,6 +15,8 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+os.environ["KIWI_ARCHIVE_ID_HMAC_KEY"] = "identity-pipeline-test-archive-key-000000000000000000"
 
 from memory_identity import (
     IDENTITY_NARRATIVE_CONTRACT,
@@ -105,14 +108,24 @@ def main() -> None:
 
     conversation_ref = opaque_archive_identifier("conversation-codex-old", "conversation")
     event_ref = opaque_archive_identifier("cc_vps1:event:42", "event")
-    require(re.fullmatch(r"conv_[0-9a-f]{64}", conversation_ref), "conversation id is not opaque")
-    require(re.fullmatch(r"evt_[0-9a-f]{64}", event_ref), "event id is not opaque")
+    require(re.fullmatch(r"conv2_[0-9a-f]{64}", conversation_ref), "conversation id is not opaque")
+    require(re.fullmatch(r"evt2_[0-9a-f]{64}", event_ref), "event id is not opaque")
     require(
         "conversation-codex-old" not in conversation_ref and "cc_vps1:event:42" not in event_ref,
         "opaque ids retained caller labels",
     )
-    require(opaque_archive_identifier(conversation_ref, "conversation") == conversation_ref,
-            "opaque archive id is not restore-idempotent")
+    require(opaque_archive_identifier(conversation_ref, "conversation") != conversation_ref,
+            "ordinary ingest trusted a caller-supplied opaque-looking id")
+    require(opaque_archive_identifier(conversation_ref, "conversation", allow_precomputed=True) == conversation_ref,
+            "trusted backup restore is not idempotent")
+
+    original_key = os.environ["KIWI_ARCHIVE_ID_HMAC_KEY"]
+    os.environ["KIWI_ARCHIVE_ID_HMAC_KEY"] = "different-identity-pipeline-key-0000000000000000000"
+    require(
+        opaque_archive_identifier("conversation-codex-old", "conversation") != conversation_ref,
+        "archive ids do not depend on the server-only key",
+    )
+    os.environ["KIWI_ARCHIVE_ID_HMAC_KEY"] = original_key
 
     relationship, errors = prepare_generated_memory("我答应知知不会把自己按入口分开。", memory_kind="relationship")
     require(not errors and relationship["content"].startswith("我答应"), "valid first-person memory rejected")

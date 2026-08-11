@@ -56,9 +56,12 @@ from config import (
 )
 from memory_extractor import extract_memories
 from memory_identity import (
+    ArchiveIdentifierConfigError,
     MemoryClientConfigError,
     RECALL_IDENTITY_INSTRUCTION,
+    archive_identifier_key_fingerprint,
     authenticate_memory_client,
+    is_opaque_archive_identifier,
     prepare_generated_memory,
     validate_autobiographical_memory,
 )
@@ -444,6 +447,18 @@ def _public_archive_record(row, allowed_fields: tuple[str, ...]) -> dict:
     """Project audit rows onto the identity-neutral public archive contract."""
     source = dict(row)
     return {field: source.get(field) for field in allowed_fields}
+
+
+def _assert_current_archive_rows(rows) -> None:
+    """Never serialize legacy/raw room identifiers through a public response."""
+    for row in rows:
+        source = dict(row)
+        conversation_id = source.get("conversation_id")
+        event_id = source.get("event_id")
+        if conversation_id and not is_opaque_archive_identifier(conversation_id, "conversation"):
+            raise HTTPException(status_code=503, detail="legacy archive identifiers require migration")
+        if event_id and not is_opaque_archive_identifier(event_id, "event"):
+            raise HTTPException(status_code=503, detail="legacy archive identifiers require migration")
 
 
 def _required_memory_content(payload: dict, field: str = "content", max_length: int = 200000) -> str:
@@ -1611,10 +1626,12 @@ async def memory_ingest_event(request: Request):
             memory_space_id=context.memory_space_id,
             assistant_identity_id=context.assistant_identity_id,
         )
+    except ArchiveIdentifierConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     # Source metadata stays available for audit in PostgreSQL, never in recalled prose.
-    return {"created": bool(result.get("created")), "event_id": result.get("event_id", event["event_id"])}
+    return {"created": bool(result.get("created")), "event_id": result["event_id"]}
 
 
 @app.post("/memory/v1/events/ingest-batch")
@@ -1640,6 +1657,8 @@ async def memory_ingest_event_batch(request: Request):
             memory_space_id=context.memory_space_id,
             assistant_identity_id=context.assistant_identity_id,
         )
+    except ArchiveIdentifierConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     created = sum(1 for result in results if result.get("created"))
@@ -1669,6 +1688,7 @@ async def memory_archive_conversations(
         before_at=before_at,
         before_conversation_id=before_id,
     )
+    _assert_current_archive_rows(rows)
     has_more = len(rows) > limit
     visible = rows[:limit]
     next_cursor = None
@@ -1695,6 +1715,8 @@ async def memory_archive_conversation(
     conversation_id = str(conversation_id or "").strip()
     if not conversation_id or len(conversation_id) > 200:
         raise HTTPException(status_code=422, detail="invalid conversation_id")
+    if not is_opaque_archive_identifier(conversation_id, "conversation"):
+        raise HTTPException(status_code=422, detail="conversation_id must be an opaque archive reference")
     limit = max(1, min(int(limit), 500))
     before_at, before_id = _decode_archive_cursor(cursor)
     rows = await get_memory_event_conversation_page(
@@ -1705,6 +1727,7 @@ async def memory_archive_conversation(
         before_event_id=before_id,
         include_system=include_system,
     )
+    _assert_current_archive_rows(rows)
     has_more = len(rows) > limit
     visible = rows[:limit]
     next_cursor = None
@@ -1741,6 +1764,8 @@ async def memory_archive_search(request: Request):
     conversation_filter = str(payload.get("conversation_id") or "").strip() or None
     if conversation_filter and len(conversation_filter) > 200:
         raise HTTPException(status_code=422, detail="conversation_id exceeds 200 characters")
+    if conversation_filter and not is_opaque_archive_identifier(conversation_filter, "conversation"):
+        raise HTTPException(status_code=422, detail="conversation_id must be an opaque archive reference")
     rows = await search_memory_events(
         query,
         memory_space_id=context.memory_space_id,
@@ -1750,6 +1775,7 @@ async def memory_archive_search(request: Request):
         conversation_id=conversation_filter,
         role=role,
     )
+    _assert_current_archive_rows(rows)
     has_more = len(rows) > limit
     visible = rows[:limit]
     next_cursor = None
@@ -1848,11 +1874,14 @@ async def memory_handoff(request: Request):
         tail_count = max(1, min(int(payload.get("tail_count", 6)), 50))
     except (TypeError, ValueError):
         raise HTTPException(status_code=422, detail="tail_count must be an integer")
-    handoff = await get_memory_handoff(
-        current_conversation_id=current_conversation_id,
-        tail_count=tail_count,
-        memory_space_id=context.memory_space_id,
-    )
+    try:
+        handoff = await get_memory_handoff(
+            current_conversation_id=current_conversation_id,
+            tail_count=tail_count,
+            memory_space_id=context.memory_space_id,
+        )
+    except ArchiveIdentifierConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     return {
         "identity_instruction": RECALL_IDENTITY_INSTRUCTION,
         "handoff": handoff,
@@ -5886,9 +5915,26 @@ async def api_sync_export():
             event_rows = await conn.fetch("""
                 SELECT * FROM memory_events ORDER BY occurred_at, event_id
             """)
+            stored_archive_fingerprint = await conn.fetchval(
+                "SELECT value FROM gateway_config WHERE key='archive_id_hmac_key_fingerprint'"
+            )
         memories = [_serialize_datetimes(dict(r)) for r in mem_rows]
         memory_versions = [_serialize_datetimes(dict(r)) for r in version_rows]
         memory_events = [_serialize_datetimes(dict(r)) for r in event_rows]
+        current_archive_ids = bool(memory_events) and all(
+            is_opaque_archive_identifier(event.get("event_id"), "event")
+            and is_opaque_archive_identifier(event.get("conversation_id"), "conversation")
+            for event in memory_events
+        )
+        archive_fingerprint = archive_identifier_key_fingerprint() if current_archive_ids else ""
+        if current_archive_ids and stored_archive_fingerprint != archive_fingerprint:
+            raise ArchiveIdentifierConfigError(
+                "archive HMAC key does not match the fingerprint recorded with existing events"
+            )
+        archive_manifest = {
+            "identifier_version": 2 if current_archive_ids else 1,
+            "key_fingerprint": archive_fingerprint,
+        }
 
         # 配置
         all_config = await get_all_config()
@@ -5910,6 +5956,7 @@ async def api_sync_export():
             zf.writestr("memories.json", json.dumps(memories, ensure_ascii=False, indent=2))
             zf.writestr("memory_versions.json", json.dumps(memory_versions, ensure_ascii=False, indent=2))
             zf.writestr("memory_events.json", json.dumps(memory_events, ensure_ascii=False, indent=2))
+            zf.writestr("archive_manifest.json", json.dumps(archive_manifest, ensure_ascii=False, indent=2))
             zf.writestr("config.json", json.dumps(config_flat, ensure_ascii=False, indent=2))
             zf.writestr("settings.json", json.dumps(settings, ensure_ascii=False, indent=2))
         buf.seek(0)
@@ -5973,6 +6020,27 @@ async def api_sync_import_backup(file: UploadFile = File(...)):
 
         with zipfile.ZipFile(buf, 'r') as zf:
             names = zf.namelist()
+
+            archived_events = json.loads(zf.read("memory_events.json")) if "memory_events.json" in names else []
+            trusted_opaque_archive = False
+            if archived_events:
+                current_flags = [
+                    is_opaque_archive_identifier(event.get("event_id"), "event")
+                    and is_opaque_archive_identifier(event.get("conversation_id"), "conversation")
+                    for event in archived_events
+                ]
+                if any(current_flags) and not all(current_flags):
+                    return JSONResponse(status_code=409, content={"error": "backup mixes legacy and current archive identifiers"})
+                trusted_opaque_archive = all(current_flags)
+                if trusted_opaque_archive:
+                    if "archive_manifest.json" not in names:
+                        return JSONResponse(status_code=409, content={"error": "current archive backup is missing its key manifest"})
+                    manifest = json.loads(zf.read("archive_manifest.json"))
+                    if (
+                        int(manifest.get("identifier_version") or 0) != 2
+                        or manifest.get("key_fingerprint") != archive_identifier_key_fingerprint()
+                    ):
+                        return JSONResponse(status_code=409, content={"error": "backup archive HMAC key does not match this server"})
 
             # 导入项目
             if "projects.json" in names:
@@ -6075,7 +6143,6 @@ async def api_sync_import_backup(file: UploadFile = File(...)):
             # 完整对话原文是 append-only 证据：备份恢复只做幂等插入，
             # 同 event_id 的不同内容会触发冲突，不得覆盖旧原文。
             if "memory_events.json" in names:
-                archived_events = json.loads(zf.read("memory_events.json"))
                 for event in archived_events:
                     restored = await ingest_memory_event(
                         event_id=str(event.get("event_id") or ""),
@@ -6087,6 +6154,7 @@ async def api_sync_import_backup(file: UploadFile = File(...)):
                         metadata=event.get("metadata") if isinstance(event.get("metadata"), dict) else {},
                         memory_space_id=str(event.get("memory_space_id") or "zhizhi_grey"),
                         assistant_identity_id=str(event.get("assistant_identity_id") or "grey_knox"),
+                        trusted_opaque_ids=trusted_opaque_archive,
                     )
                     if restored.get("created"):
                         result["memory_events"] += 1

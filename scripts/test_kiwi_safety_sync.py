@@ -1476,7 +1476,7 @@ async def test_complete_chat_archive(client: httpx.AsyncClient) -> None:
     require(first.status_code == 200 and first.json()["created"] == len(events), first.text)
     require(retry.status_code == 200 and retry.json()["duplicates"] == len(events), retry.text)
     require(
-        all(re.fullmatch(r"evt_[0-9a-f]{64}", item) for item in first.json()["event_ids"]),
+        all(re.fullmatch(r"evt2_[0-9a-f]{64}", item) for item in first.json()["event_ids"]),
         f"ingest response exposed caller event labels: {first.text}",
     )
     require(await _pool_fetchval("SELECT COUNT(*) FROM memory_events") == len(events), "batch replay duplicated raw evidence")
@@ -1608,6 +1608,55 @@ async def test_complete_chat_archive(client: httpx.AsyncClient) -> None:
     require(source_search.status_code == 422, "archive search accepted a source-room filter")
     passed("T-ARCH-3 literal full-text search is authenticated, filtered, and cursor-paged")
 
+    forged_final_id = first.json()["event_ids"][0]
+    forged = await client.post(
+        "/memory/v1/events/ingest",
+        headers=auth("cc2"),
+        json={
+            "event_id": forged_final_id,
+            "conversation_id": conv_a,
+            "role": "user",
+            "content": "普通入口不能冒充服务器生成的成品编号。",
+            "occurred_at": "2026-08-11T04:30:00Z",
+        },
+    )
+    require(
+        forged.status_code == 200
+        and forged.json()["created"] is True
+        and forged.json()["event_id"] != forged_final_id,
+        f"ordinary ingest trusted a caller-supplied opaque id: {forged.text}",
+    )
+
+    original_archive_key = os.environ["KIWI_ARCHIVE_ID_HMAC_KEY"]
+    os.environ["KIWI_ARCHIVE_ID_HMAC_KEY"] = "rotated-safety-suite-key-000000000000000000000000"
+    rotated = await client.post(
+        "/memory/v1/events/ingest",
+        headers=auth("codex"),
+        json={
+            "event_id": "rotation-must-fail",
+            "conversation_id": "rotation-must-fail",
+            "role": "user",
+            "content": "错误换钥匙时不得继续写入。",
+        },
+    )
+    os.environ["KIWI_ARCHIVE_ID_HMAC_KEY"] = original_archive_key
+    require(rotated.status_code == 503, f"archive HMAC key rotation was not rejected: {rotated.text}")
+
+    await _pool_execute("""
+        INSERT INTO memory_events (
+            event_id, memory_space_id, assistant_identity_id, source_client,
+            conversation_id, role, content, occurred_at, metadata
+        ) VALUES (
+            'legacy-event-room-label', 'zhizhi_grey', 'grey_knox', 'legacy-test',
+            'conversation-codex-legacy', 'user', '旧记录不得从公开归档泄露。',
+            '2099-01-01T00:00:00Z', '{}'::jsonb
+        )
+    """)
+    legacy_read = await client.get("/memory/v1/archive/conversations", headers=auth("cc1"))
+    require(legacy_read.status_code == 503, f"legacy room id leaked through archive API: {legacy_read.text}")
+    await _pool_execute("DELETE FROM memory_events WHERE event_id='legacy-event-room-label'")
+    passed("T-ARCH-4 keyed opaque ids reject forgery, key rotation, and legacy public reads")
+
     await _truncate("memory_events")
     await _upsert_config("chat_archive_enabled", "true")
     archive_context = await app_module._archive_gateway_user(
@@ -1650,12 +1699,30 @@ async def test_complete_chat_archive(client: httpx.AsyncClient) -> None:
     require(backup.status_code == 200, f"archive backup export failed: {backup.text}")
     with zipfile.ZipFile(io.BytesIO(backup.content)) as exported_zip:
         require("memory_events.json" in exported_zip.namelist(), "backup omitted complete transcript evidence")
+        require("archive_manifest.json" in exported_zip.namelist(), "backup omitted archive key manifest")
         exported_events = json.loads(exported_zip.read("memory_events.json"))
+        exported_manifest = json.loads(exported_zip.read("archive_manifest.json"))
     require(len(exported_events) == 2, f"backup exported wrong transcript count: {exported_events}")
+    require(
+        exported_manifest.get("identifier_version") == 2
+        and re.fullmatch(r"[0-9a-f]{64}", exported_manifest.get("key_fingerprint", "")),
+        f"backup archive manifest is invalid: {exported_manifest}",
+    )
 
     restore_buffer = io.BytesIO()
     with zipfile.ZipFile(restore_buffer, "w", zipfile.ZIP_DEFLATED) as restore_zip:
         restore_zip.writestr("memory_events.json", json.dumps(exported_events, ensure_ascii=False))
+        restore_zip.writestr("archive_manifest.json", json.dumps(exported_manifest, ensure_ascii=False))
+
+    original_archive_key = os.environ["KIWI_ARCHIVE_ID_HMAC_KEY"]
+    os.environ["KIWI_ARCHIVE_ID_HMAC_KEY"] = "wrong-restore-archive-key-00000000000000000000000"
+    wrong_key_restore = await client.post(
+        "/sync/import-backup",
+        files={"file": ("wrong-key.zip", restore_buffer.getvalue(), "application/zip")},
+    )
+    os.environ["KIWI_ARCHIVE_ID_HMAC_KEY"] = original_archive_key
+    require(wrong_key_restore.status_code == 409, "backup restored under a different archive HMAC key")
+
     await _truncate("memory_events")
     restored = await client.post(
         "/sync/import-backup",
@@ -1671,7 +1738,7 @@ async def test_complete_chat_archive(client: httpx.AsyncClient) -> None:
         session_id="disabled", request_key="disabled", user_message="不应自动归档", model="test-model"
     )
     require(disabled is None, "disabled gateway archive still captured messages")
-    passed("T-ARCH-4 gateway capture and backup preserve visible prose independently of semantic extraction")
+    passed("T-ARCH-5 gateway capture and backup preserve visible prose independently of semantic extraction")
 
 
 async def test_autobiographical_pipelines() -> None:
@@ -2007,6 +2074,7 @@ async def run_suite(test_dsn: str) -> None:
     })
     admin_secret = "test-admin-key-00000000000000000000001"
     os.environ["KIWI_ADMIN_TOKEN_SHA256"] = hashlib.sha256(admin_secret.encode("utf-8")).hexdigest()
+    os.environ["KIWI_ARCHIVE_ID_HMAC_KEY"] = "safety-suite-archive-hmac-key-000000000000000000000"
 
     import importlib
 
