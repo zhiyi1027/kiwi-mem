@@ -86,6 +86,10 @@ def main() -> None:
     user_fact, errors = prepare_generated_memory("用户不喜欢香菜。", memory_kind="user_fact")
     require(not errors and user_fact["content"] == "知知不喜欢香菜。", "user label was not normalized")
 
+    technical = "知知设计了多用户系统，也在意用户名、用户界面和用户体验。"
+    technical_fact, errors = prepare_generated_memory(technical, memory_kind="user_fact")
+    require(not errors and technical_fact["content"] == technical, "technical uses of 用户 were corrupted")
+
     relationship, errors = prepare_generated_memory("我答应知知不会把自己按入口分开。", memory_kind="relationship")
     require(not errors and relationship["content"].startswith("我答应"), "valid first-person memory rejected")
 
@@ -115,6 +119,9 @@ def main() -> None:
 
     profile, errors = validate_profile_narrative("## 基本档案\n- 用户不喜欢香菜。\n- 她喜欢温柔但直接的沟通。")
     require(not errors and "用户" not in profile and "知知" in profile, "profile labels were not normalized")
+    technical_profile = "## 近期重点\n- 知知正在设计多用户系统，也关注用户体验。"
+    profile, errors = validate_profile_narrative(technical_profile)
+    require(not errors and profile == technical_profile, "profile corrupted legitimate technical terminology")
     _, errors = validate_profile_narrative("## Helpful User Insights\n- AI答应知知会一直记得。")
     require(errors, "observer assistant entered profile")
 

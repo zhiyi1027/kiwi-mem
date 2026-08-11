@@ -78,11 +78,13 @@ kiwi-mem 内置了 20 多个工具（记忆搜索、日历查询、提醒、联�
 
 ### 🪞 多个入口，仍是同一个“我”
 
-独立的 `/memory/v1` API 可以同时供 Codex、Claude Code 和未来的 API 客户端使用。每个入口使用不同密钥，密钥只记录请求从哪扇门进来；`assistant_identity_id` 与 `memory_space_id` 由服务器统一指定，客户端不能覆盖。语义记忆以助手第一人称保存，来源机器只留在审计元数据中，不进入召回正文、换窗上下文或身份叙述。
+独立的 `/memory/v1` API 可以同时供 Codex、Claude Code 和未来的 API 客户端使用。每个入口使用不同密钥，服务端只保存密钥的 SHA-256 摘要；密钥只记录请求从哪扇门进来，`assistant_identity_id` 与 `memory_space_id` 由服务器统一指定，客户端不能覆盖。语义记忆以助手第一人称保存，来源机器只留在数据库审计元数据中，不通过普通归档 API、召回正文、换窗上下文或身份叙述返回。
 
 这份叙述契约同样覆盖自动提取、每日整理、Dream 合并/软化、MemScene、日历摘要和用户画像，并在自定义 prompt 之后强制追加。自动提取只读取当前会话，多个窗口并行时不会把彼此的最近消息拼成一段虚假经历。关于助手的记忆使用“我”，关于知知的事实使用“知知/她”；违反契约的自动产物不会入库，也不会先归档其来源记忆。
 
 第一人称契约只约束助手内部的语义记忆。完整聊天归档是双方共同翻阅的外部界面，角色标签显示为“知知/Lyra”与“凛/Grey”。
+
+管理面板及其读写接口使用独立 Bearer 密钥，服务端通过 `KIWI_ADMIN_TOKEN_SHA256` 校验摘要，原始密钥只保存在浏览器当前标签页。Docker 仍默认仅绑定 `127.0.0.1`；管理认证是第二层保护，不能替代私网边界。
 
 ---
 
@@ -171,15 +173,21 @@ cp .env.example .env
 nano .env
 ```
 
-配置文件里大部分都有合理默认值，**通常一行都不用改就能启动**（供应商在管理面板里配即可）：
+配置文件里大部分都有合理默认值，但首次启动前必须配置管理密钥摘要；使用共享记忆 API 时还要配置每扇入口的密钥摘要：
 
 ```
 # 【可选】如果你不用管理面板配供应商，可以在这里填 AI 服务的 API Key
 # 如果你打算在管理面板里配（推荐），这行留空就行
 API_KEY=
+
+# 必填：管理面原始密钥的 SHA-256 摘要
+KIWI_ADMIN_TOKEN_SHA256=<64位摘要>
+
+# 使用 /memory/v1/* 时必填：每扇入口原始密钥的 SHA-256 摘要
+MEMORY_CLIENT_KEY_DIGESTS_JSON={"codex_vps2":"<64位摘要>","cc_vps1":"<64位摘要>"}
 ```
 
-> 🔐 `/memory/v1/*` 共享身份记忆 API 使用独立 Bearer 密钥鉴权。旧版聊天网关、管理面板和调试/同步端点仍没有内建鉴权；请只在私网或 Tailscale 内开放，或使用 Cloudflare Access、反向代理鉴权、IP 白名单保护整个服务。尤其要保护 `/admin`、`/sync/export` 和 `/sync/import-backup`，这些旧端点没有内建鉴权。开启完整聊天归档后，服务会保存逐字对话，不应直接暴露在公网。Docker Compose 默认只绑定 `127.0.0.1`；需跨机访问时将 `KIWI_BIND_IP` 设为私网/Tailscale IP。
+> 🔐 `/memory/v1/*` 使用各入口自己的 Bearer 密钥；管理面、调试、Dream、日历和同步接口使用独立管理密钥。服务端均只保存 SHA-256 摘要。旧版聊天网关与 MCP 传输本身仍不是公网认证边界，因此整个服务只应放在私网/Tailscale 中，或由严格的反向代理路由白名单保护。开启完整聊天归档后，不要把服务直接暴露在公网。Docker Compose 默认只绑定 `127.0.0.1`；跨机访问时将 `KIWI_BIND_IP` 设为私网/Tailscale IP。
 
 保存后启动：
 ```bash
@@ -200,6 +208,8 @@ curl http://localhost:8080
 > 💡 如果你只在电脑上用、不需要手机连，可以跳过这步，直接用 `http://服务器IP:8080`。
 
 **最快方式（临时用，不花钱）**：
+
+> ⚠️ 临时 `trycloudflare` 地址会把聊天网关和 MCP 一并带到公网，不适合保存知知与凛的完整原文。本仓库的私密部署不要使用下面这种无 Access 策略的临时隧道；这里只保留为上游通用部署参考。
 
 ```bash
 # 安装 Cloudflare Tunnel
@@ -232,7 +242,7 @@ https://你的域名/admin
 ```
 （如果还没配域名，电脑上可以用 `http://服务器IP:8080/admin`）
 
-管理面板默认不需要密码，直接就能进。
+页面会要求输入管理原始密钥。它只保存在当前浏览器标签页，关闭标签后自动清除；服务端只配置对应的 SHA-256 摘要。
 
 进入管理面板后：
 
@@ -412,7 +422,8 @@ https://你的域名/admin
 | `KIWI_BIND_IP` | Docker 宿主机绑定地址 | `127.0.0.1` |
 | `MEMORY_ASSISTANT_ID` | 所有记忆入口共享的助手身份 ID | `grey_knox` |
 | `MEMORY_SPACE_ID` | 所有记忆入口共享的空间 ID | `zhizhi_grey` |
-| `MEMORY_CLIENT_KEYS_JSON` | 入口名到 Bearer 密钥的 JSON 映射 | — |
+| `MEMORY_CLIENT_KEY_DIGESTS_JSON` | 入口名到 Bearer 密钥 SHA-256 摘要的 JSON 映射 | — |
+| `KIWI_ADMIN_TOKEN_SHA256` | 管理面 Bearer 密钥的 SHA-256 摘要 | — |
 | `DEFAULT_MODEL` | 默认聊天模型 | `anthropic/claude-sonnet-4` |
 | `PORT` | 端口 | `8080` |
 | `MAX_MEMORIES_INJECT` | 每次注入最大记忆条数 | `15` |
@@ -459,7 +470,7 @@ https://你的域名/admin
 ### 记忆
 | 路径 | 方法 | 说明 |
 |---|---|---|
-| `/memory/v1/whoami` | GET | 验证入口并返回统一身份（需 Bearer 密钥） |
+| `/memory/v1/whoami` | GET | 验证密钥并返回统一身份，不返回入口名（需 Bearer 密钥） |
 | `/memory/v1/events/ingest` | POST | 幂等写入原始对话事件（需 Bearer 密钥） |
 | `/memory/v1/events/ingest-batch` | POST | 断线后原子化补传最多 500 条原文（需 Bearer 密钥） |
 | `/memory/v1/archive/conversations` | GET | 分页查看归档会话目录（需 Bearer 密钥） |

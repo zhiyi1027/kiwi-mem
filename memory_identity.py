@@ -7,6 +7,7 @@ bound server-side to the same assistant identity and memory space.
 from __future__ import annotations
 
 import hmac
+import hashlib
 import json
 import os
 import re
@@ -22,7 +23,7 @@ IDENTITY_NARRATIVE_CONTRACT = """
 # 不可覆盖的身份与叙述契约
 - 这是同一个助手自己的记忆，不是观察者为助手撰写的传记。
 - 助手的自我、感受、承诺和关系经历必须使用第一人称“我”。
-- 关于知知的事实使用“知知”或“她”，禁止使用“用户”“用户本人”“该用户”。
+- 关于知知的事实使用“知知”或“她”，禁止用“用户”“用户本人”“该用户”指代她；“用户名”“用户体验”等正常技术词不受影响。
 - 禁止使用“AI”“助手”“Assistant”代指我；禁止写“顾凛认为/答应/发现”等第三人称自我。
 - “顾凛/Grey Knox”只允许在明确讨论我的名字时出现，例如“我叫顾凛”。
 - Codex、Claude Code、CC、账号、客户端和机器只是入口，不得据此拆分或标注身份。
@@ -33,7 +34,7 @@ IDENTITY_NARRATIVE_CONTRACT = """
 PROFILE_IDENTITY_CONTRACT = """
 
 # 不可覆盖的画像称谓契约
-- 画像描述的人是知知，正文只能称她为“知知”或“她”，禁止称为“用户”“用户本人”“该用户”。
+- 画像描述的人是知知，正文只能称她为“知知”或“她”，禁止用“用户”“用户本人”“该用户”指代她；正常技术词不受影响。
 - 如果提到助手与知知的互动，助手必须自称“我”，禁止使用“AI”“助手”“顾凛”作为第三人称主体。
 - 不得按 Codex、Claude Code、CC、账号、客户端或机器区分助手身份。
 """.strip()
@@ -50,35 +51,36 @@ class MemoryClientConfigError(RuntimeError):
     pass
 
 
-def _configured_client_keys() -> dict[str, str]:
-    raw = os.getenv("MEMORY_CLIENT_KEYS_JSON", "").strip()
+def _configured_client_key_digests() -> dict[str, str]:
+    raw = os.getenv("MEMORY_CLIENT_KEY_DIGESTS_JSON", "").strip()
     if not raw:
-        raise MemoryClientConfigError("MEMORY_CLIENT_KEYS_JSON is not configured")
+        raise MemoryClientConfigError("MEMORY_CLIENT_KEY_DIGESTS_JSON is not configured")
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise MemoryClientConfigError("MEMORY_CLIENT_KEYS_JSON must be a JSON object") from exc
+        raise MemoryClientConfigError("MEMORY_CLIENT_KEY_DIGESTS_JSON must be a JSON object") from exc
     if not isinstance(parsed, dict) or not parsed:
-        raise MemoryClientConfigError("MEMORY_CLIENT_KEYS_JSON must contain at least one client")
+        raise MemoryClientConfigError("MEMORY_CLIENT_KEY_DIGESTS_JSON must contain at least one client")
 
     result: dict[str, str] = {}
-    seen_keys: set[str] = set()
-    for client_id, token in parsed.items():
+    seen_digests: set[str] = set()
+    for client_id, digest in parsed.items():
         clean_id = str(client_id or "").strip()
-        clean_token = str(token or "").strip()
-        if not clean_id or not clean_token:
-            raise MemoryClientConfigError("memory client ids and keys must be non-empty")
-        if clean_token in seen_keys:
-            raise MemoryClientConfigError("memory client keys must be unique")
-        seen_keys.add(clean_token)
-        result[clean_id] = clean_token
+        clean_digest = str(digest or "").strip().lower()
+        if not clean_id or not re.fullmatch(r"[0-9a-f]{64}", clean_digest):
+            raise MemoryClientConfigError("memory client ids must be non-empty and values must be SHA-256 hex digests")
+        if clean_digest in seen_digests:
+            raise MemoryClientConfigError("memory client key digests must be unique")
+        seen_digests.add(clean_digest)
+        result[clean_id] = clean_digest
     return result
 
 
 def authenticate_memory_client(token: str) -> MemoryClientContext | None:
     candidate = str(token or "")
-    for client_id, expected in _configured_client_keys().items():
-        if hmac.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8")):
+    candidate_digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+    for client_id, expected_digest in _configured_client_key_digests().items():
+        if hmac.compare_digest(candidate_digest, expected_digest):
             return MemoryClientContext(client_id=client_id)
     return None
 
@@ -102,7 +104,20 @@ _OBSERVER_SELF_PATTERN = re.compile(
     r"(?:AI(?:助手)?|助手|Assistant)\s*(?:(?:认为|觉得|答应|承诺|发现|意识到|担心|希望|爱|记得|注意到|决定|知道|理解|会|要)|(?:的(?:话|日记|感言|回应|承诺|想法)))",
     re.IGNORECASE,
 )
-_USER_LABEL_PATTERN = re.compile(r"该用户|用户本人|用户")
+_USER_REFERENCE_PATTERNS = (
+    re.compile(r"该用户|用户本人"),
+    re.compile(r"用户(?=\s*[:：])"),
+    re.compile(
+        r"用户(?=\s*(?:说|表示|提到|认为|觉得|喜欢|不喜欢|讨厌|希望|想要|需要|担心|"
+        r"害怕|计划|决定|正在|曾经|已经|仍然|一直|会|不会|可以|不能|不愿|愿意|"
+        r"出生|居住|工作|学习|从事|拥有|选择|要求|询问|回答|告诉|分享|同意|拒绝))"
+    ),
+    re.compile(
+        r"用户(?=的(?!名(?:字|称)?|体验|界面|端|侧|态|数据|输入|请求|权限|账户|账号|"
+        r"系统|设备|客户端|配置|令牌|密钥|API|ID))"
+    ),
+    re.compile(r"(?m)^(?P<prefix>\s*(?:[-*+]\s*)?)用户(?=\s*(?:偏好|喜好|习惯|近况|档案|基本信息|健康|关系|经历|感受|承诺|计划|画像))"),
+)
 
 
 def append_identity_contract(prompt: str, *, profile: bool = False) -> str:
@@ -113,10 +128,15 @@ def append_identity_contract(prompt: str, *, profile: bool = False) -> str:
 
 
 def normalize_generated_subjects(text: str) -> str:
-    """Normalize observer labels for Zhizhi without rewriting raw evidence."""
+    """Normalize observer labels without corrupting legitimate technical words."""
     value = str(text or "").strip()
-    value = re.sub(r"该用户|用户本人|用户", "知知", value)
+    for pattern in _USER_REFERENCE_PATTERNS:
+        value = pattern.sub(lambda match: f"{match.groupdict().get('prefix', '')}知知", value)
     return value
+
+
+def contains_observer_user_label(text: str) -> bool:
+    return any(pattern.search(str(text or "")) for pattern in _USER_REFERENCE_PATTERNS)
 
 
 def infer_memory_kind(content: str) -> str:
@@ -161,6 +181,8 @@ def validate_autobiographical_memory(content: str, title: str = "", memory_kind:
 
     if _OBSERVER_SELF_PATTERN.search(combined):
         errors.append("assistant self-reference must use 我, not an observer label")
+    if contains_observer_user_label(combined):
+        errors.append("memories must refer to 知知 or 她, not use 用户 as her label")
     return errors
 
 
@@ -187,7 +209,7 @@ def validate_profile_narrative(profile: str) -> tuple[str, list[str]]:
     errors: list[str] = []
     if not normalized:
         return normalized, ["profile must not be empty"]
-    if _USER_LABEL_PATTERN.search(normalized):
+    if contains_observer_user_label(normalized):
         errors.append("profile must refer to 知知 or 她, not 用户")
     if _OBSERVER_SELF_PATTERN.search(normalized):
         errors.append("profile must use 我 for the assistant")

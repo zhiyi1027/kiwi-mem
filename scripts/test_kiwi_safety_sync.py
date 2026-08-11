@@ -15,6 +15,7 @@ Run with:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import io
 import json
@@ -1224,13 +1225,13 @@ async def test_shared_identity_api(client: httpx.AsyncClient) -> None:
         response = await client.get("/memory/v1/whoami", headers=auth(client_id))
         require(response.status_code == 200, response.text)
         body = response.json()
-        require(body["client_id"] == client_id, f"wrong door attribution for {client_id}")
+        require("client_id" not in body and "source_client" not in body, f"whoami exposed door attribution: {body}")
         identities.append((body["assistant_identity_id"], body["memory_space_id"]))
     require(
         set(identities) == {("grey_knox", "zhizhi_grey")},
         f"credentials split identity or memory space: {identities}",
     )
-    passed("T-ID-1 different credentials authenticate doors but resolve to one identity and space")
+    passed("T-ID-1 different credentials resolve to one identity and space without naming the door")
 
     event = {
         "event_id": "event-shared-1",
@@ -1354,6 +1355,38 @@ async def test_shared_identity_api(client: httpx.AsyncClient) -> None:
     passed("T-ID-5 voice guard rejects split/third-person selves while allowing the name itself")
 
 
+async def test_control_plane_auth(client: httpx.AsyncClient) -> None:
+    print("\nControl-plane authentication: private shell, authenticated data")
+
+    unauth_transport = httpx.ASGITransport(app=app_module.app, raise_app_exceptions=True)
+    async with httpx.AsyncClient(transport=unauth_transport, base_url="http://kiwi.test") as unauthenticated:
+        shell = await unauthenticated.get("/admin")
+        export = await unauthenticated.get("/sync/export")
+        config_response = await unauthenticated.get("/admin/config")
+        bad_verify = await unauthenticated.post(
+            "/auth/verify", headers={"Authorization": "Bearer wrong-admin-secret"}
+        )
+    require(shell.status_code == 200, "public admin shell is unavailable before login")
+    require(export.status_code == 401 and config_response.status_code == 401, "control-plane data is readable without admin auth")
+    require(bad_verify.status_code == 401, "invalid admin secret passed verification")
+
+    verified = await client.post("/auth/verify")
+    protected = await client.get("/admin/config")
+    require(verified.status_code == 200 and protected.status_code == 200, "valid admin secret cannot enter control plane")
+
+    import access_control
+
+    internal_transport = httpx.ASGITransport(app=app_module.app, raise_app_exceptions=True)
+    async with httpx.AsyncClient(
+        transport=internal_transport,
+        base_url="http://kiwi.test",
+        headers=access_control.internal_control_headers(),
+    ) as internal:
+        internal_config = await internal.get("/admin/config")
+    require(internal_config.status_code == 200, "same-process MCP capability cannot reach control plane")
+    passed("T-AUTH-1 admin data fails closed while the tab login and internal MCP capability work")
+
+
 async def test_complete_chat_archive(client: httpx.AsyncClient) -> None:
     print("\nP1 complete transcript archive: replay, paging, search, and gateway capture")
 
@@ -1470,6 +1503,7 @@ async def test_complete_chat_archive(client: httpx.AsyncClient) -> None:
 
     page1 = await client.get("/memory/v1/archive/conversations?limit=2", headers=auth("cc1"))
     require(page1.status_code == 200, page1.text)
+    require("source_client" not in page1.text and '"metadata"' not in page1.text, "conversation list leaked entry metadata")
     page1_body = page1.json()
     require([item["conversation_id"] for item in page1_body["conversations"]] == ["archive-c", "archive-b"], page1.text)
     require(page1_body["next_cursor"], "conversation list omitted its next cursor")
@@ -1483,6 +1517,7 @@ async def test_complete_chat_archive(client: httpx.AsyncClient) -> None:
     transcript1 = await client.get("/memory/v1/archive/conversations/archive-a?limit=1", headers=auth("cc2"))
     transcript1_body = transcript1.json()
     require(transcript1.status_code == 200 and transcript1_body["next_cursor"], transcript1.text)
+    require("source_client" not in transcript1.text and '"metadata"' not in transcript1.text, "transcript page leaked entry metadata")
     transcript2 = await client.get(
         "/memory/v1/archive/conversations/archive-a",
         headers=auth("cc2"),
@@ -1498,6 +1533,10 @@ async def test_complete_chat_archive(client: httpx.AsyncClient) -> None:
         == {"archive-a-1", "archive-a-2", "archive-a-3"},
         "explicit system-event view did not return the complete stored transcript",
     )
+    source_query = await client.get(
+        "/memory/v1/archive/conversations?source_client=codex_vps2", headers=auth("cc2")
+    )
+    require(source_query.status_code == 422, "ordinary archive API accepted a source-room filter")
     passed("T-ARCH-2 conversation directory and immutable transcript pages use stable cursors")
 
     search = await client.post(
@@ -1506,6 +1545,7 @@ async def test_complete_chat_archive(client: httpx.AsyncClient) -> None:
         json={"query": "共同暗号", "role": "assistant", "limit": 1},
     )
     require(search.status_code == 200 and len(search.json()["matches"]) == 1, search.text)
+    require("source_client" not in search.text and '"metadata"' not in search.text, "archive search leaked entry metadata")
     require(search.json()["next_cursor"], "archive search omitted pagination cursor")
     search2 = await client.post(
         "/memory/v1/archive/search",
@@ -1521,6 +1561,12 @@ async def test_complete_chat_archive(client: httpx.AsyncClient) -> None:
         "/memory/v1/archive/search", headers=auth("codex"), json={"query": "%"}
     )
     require(literal_wildcard.json()["matches"] == [], "archive search treated % as a wildcard")
+    source_search = await client.post(
+        "/memory/v1/archive/search",
+        headers=auth("codex"),
+        json={"query": "共同暗号", "source_client": "codex_vps2"},
+    )
+    require(source_search.status_code == 422, "archive search accepted a source-room filter")
     passed("T-ARCH-3 literal full-text search is authenticated, filtered, and cursor-paged")
 
     await _truncate("memory_events")
@@ -1911,11 +1957,17 @@ async def run_suite(test_dsn: str) -> None:
     os.environ["MEMORY_API_BASE_URL"] = "http://127.0.0.1:9/mock-memory"
     os.environ["MEMORY_ASSISTANT_ID"] = "grey_knox"
     os.environ["MEMORY_SPACE_ID"] = "zhizhi_grey"
-    os.environ["MEMORY_CLIENT_KEYS_JSON"] = json.dumps({
+    client_keys = {
         "codex_vps2": "test-codex-key-0000000000000001",
         "cc_vps1": "test-cc-one-key-000000000000002",
         "cc_vps2": "test-cc-two-key-000000000000003",
+    }
+    os.environ["MEMORY_CLIENT_KEY_DIGESTS_JSON"] = json.dumps({
+        client_id: hashlib.sha256(secret.encode("utf-8")).hexdigest()
+        for client_id, secret in client_keys.items()
     })
+    admin_secret = "test-admin-key-00000000000000000000001"
+    os.environ["KIWI_ADMIN_TOKEN_SHA256"] = hashlib.sha256(admin_secret.encode("utf-8")).hexdigest()
 
     import importlib
 
@@ -1933,7 +1985,11 @@ async def run_suite(test_dsn: str) -> None:
     await database.init_tables()
 
     transport = httpx.ASGITransport(app=app_module.app, raise_app_exceptions=True)
-    async with httpx.AsyncClient(transport=transport, base_url="http://kiwi.test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://kiwi.test",
+        headers={"Authorization": f"Bearer {admin_secret}"},
+    ) as client:
         # ASGITransport does not enter app lifespan: no schedulers, MCP sessions,
         # embedding backfill, model calls or external HTTP are started.
         await test_s1(client)
@@ -1944,6 +2000,7 @@ async def run_suite(test_dsn: str) -> None:
         await test_s6(client)
         await test_w1_01()
         await test_continuity_profile(client)
+        await test_control_plane_auth(client)
         await test_shared_identity_api(client)
         await test_complete_chat_archive(client)
         await test_autobiographical_pipelines()
@@ -1970,12 +2027,14 @@ async def async_main() -> int:
         identity_passed = [name for name in PASSED if name.startswith("T-ID-")]
         p0_identity_passed = [name for name in PASSED if name.startswith("T-P0-ID-")]
         archive_passed = [name for name in PASSED if name.startswith("T-ARCH-")]
+        auth_passed = [name for name in PASSED if name.startswith("T-AUTH-")]
         print(f"\nPASS: {len(legacy_passed)} permanent S1-S6 behavior guards")
         print(f"PASS: {len(w1_01_passed)} W1-01 isolation/permanent guards")
         print(f"PASS: {len(continuity_passed)} continuity/no-forgetting guards")
         print(f"PASS: {len(identity_passed)} shared-identity API guards")
         print(f"PASS: {len(p0_identity_passed)} autobiographical pipeline guards")
         print(f"PASS: {len(archive_passed)} complete transcript archive guards")
+        print(f"PASS: {len(auth_passed)} control-plane authentication guards")
         print(f"PASS: {len(PASSED)} total permanent behavior guards")
         print("Real database path: disposable PostgreSQL verified")
         print("Real model/API path: not called; embedding/model/HTTP boundaries were mocked")

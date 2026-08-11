@@ -69,6 +69,13 @@ from anthropic_adapter import (
     to_anthropic_request, to_anthropic_headers, get_anthropic_url,
     from_anthropic_response, anthropic_stream_to_openai,
 )
+from access_control import (
+    AdminTokenConfigError,
+    authenticate_admin_token,
+    authenticate_internal_control,
+    bearer_token,
+    is_control_plane_path,
+)
 
 # ============================================================
 # 配置项 —— 全部从环境变量读取，部署时在云平台面板里设置
@@ -327,6 +334,29 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def require_control_plane_auth(request: Request, call_next):
+    """Fail closed on every data-bearing or writable management route."""
+    if not is_control_plane_path(request.url.path):
+        return await call_next(request)
+
+    internal_token = request.headers.get("x-kiwi-internal-control", "")
+    if authenticate_internal_control(internal_token):
+        return await call_next(request)
+
+    try:
+        authenticated = authenticate_admin_token(bearer_token(request.headers.get("authorization", "")))
+    except AdminTokenConfigError as exc:
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+    if not authenticated:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "admin bearer token required"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return await call_next(request)
+
+
 def _memory_client_context(request: Request):
     """Authenticate a door while keeping identity assignment server-owned."""
     authorization = request.headers.get("authorization", "")
@@ -367,6 +397,30 @@ def _required_memory_text(payload: dict, field: str, max_length: int) -> str:
     if len(value) > max_length:
         raise HTTPException(status_code=422, detail=f"{field} exceeds {max_length} characters")
     return value
+
+
+_PUBLIC_ARCHIVE_CONVERSATION_FIELDS = (
+    "conversation_id",
+    "first_event_at",
+    "last_event_at",
+    "message_count",
+    "user_message_count",
+    "assistant_message_count",
+    "preview",
+)
+_PUBLIC_ARCHIVE_EVENT_FIELDS = (
+    "event_id",
+    "conversation_id",
+    "role",
+    "content",
+    "occurred_at",
+)
+
+
+def _public_archive_record(row, allowed_fields: tuple[str, ...]) -> dict:
+    """Project audit rows onto the identity-neutral public archive contract."""
+    source = dict(row)
+    return {field: source.get(field) for field in allowed_fields}
 
 
 def _required_memory_content(payload: dict, field: str = "content", max_length: int = 200000) -> str:
@@ -1506,10 +1560,9 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
 
 @app.get("/memory/v1/whoami")
 async def memory_whoami(request: Request):
-    """Show which door authenticated and the one identity it belongs to."""
+    """Confirm the canonical identity without exposing which door authenticated."""
     context = _memory_client_context(request)
     return {
-        "client_id": context.client_id,
         "assistant_identity_id": context.assistant_identity_id,
         "memory_space_id": context.memory_space_id,
     }
@@ -1580,20 +1633,18 @@ async def memory_archive_conversations(
     request: Request,
     limit: int = 50,
     cursor: str = "",
-    source_client: str = "",
 ):
-    """List complete archived conversations without exposing machine identity in prose."""
+    """List complete archived conversations without exposing entry metadata."""
     context = _memory_client_context(request)
     limit = max(1, min(int(limit), 200))
-    if len(source_client) > 200:
-        raise HTTPException(status_code=422, detail="source_client exceeds 200 characters")
+    if "source_client" in request.query_params:
+        raise HTTPException(status_code=422, detail="source_client is internal audit metadata")
     before_at, before_id = _decode_archive_cursor(cursor)
     rows = await list_memory_event_conversations(
         memory_space_id=context.memory_space_id,
         limit=limit + 1,
         before_at=before_at,
         before_conversation_id=before_id,
-        source_client=source_client.strip() or None,
     )
     has_more = len(rows) > limit
     visible = rows[:limit]
@@ -1602,7 +1653,7 @@ async def memory_archive_conversations(
         next_cursor = _encode_archive_cursor(visible[-1]["last_event_at"], visible[-1]["conversation_id"])
     conversations = []
     for row in visible:
-        item = dict(row)
+        item = _public_archive_record(row, _PUBLIC_ARCHIVE_CONVERSATION_FIELDS)
         item["preview"] = str(item.get("preview") or "")[:500]
         conversations.append(item)
     return {"conversations": conversations, "next_cursor": next_cursor}
@@ -1638,7 +1689,10 @@ async def memory_archive_conversation(
         next_cursor = _encode_archive_cursor(visible[-1]["occurred_at"], visible[-1]["event_id"])
     return {
         "conversation_id": conversation_id,
-        "events": list(reversed(visible)),
+        "events": [
+            _public_archive_record(row, _PUBLIC_ARCHIVE_EVENT_FIELDS)
+            for row in reversed(visible)
+        ],
         "page_order": "oldest_to_newest",
         "next_cursor": next_cursor,
     }
@@ -1651,12 +1705,7 @@ async def memory_archive_search(request: Request):
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=422, detail="request body must be a JSON object")
-    attempted = sorted({"assistant_identity_id", "memory_space_id"}.intersection(payload))
-    if attempted:
-        raise HTTPException(
-            status_code=422,
-            detail=f"identity fields are assigned by the server: {', '.join(attempted)}",
-        )
+    _reject_memory_identity_override(payload)
     query = _required_memory_text(payload, "query", 10000)
     try:
         limit = max(1, min(int(payload.get("limit", 50)), 200))
@@ -1667,11 +1716,8 @@ async def memory_archive_search(request: Request):
         raise HTTPException(status_code=422, detail="role must be user, assistant, or system")
     before_at, before_id = _decode_archive_cursor(str(payload.get("cursor") or ""))
     conversation_filter = str(payload.get("conversation_id") or "").strip() or None
-    source_filter = str(payload.get("source_client") or "").strip() or None
     if conversation_filter and len(conversation_filter) > 200:
         raise HTTPException(status_code=422, detail="conversation_id exceeds 200 characters")
-    if source_filter and len(source_filter) > 200:
-        raise HTTPException(status_code=422, detail="source_client exceeds 200 characters")
     rows = await search_memory_events(
         query,
         memory_space_id=context.memory_space_id,
@@ -1679,7 +1725,6 @@ async def memory_archive_search(request: Request):
         before_at=before_at,
         before_event_id=before_id,
         conversation_id=conversation_filter,
-        source_client=source_filter,
         role=role,
     )
     has_more = len(rows) > limit
@@ -1687,7 +1732,13 @@ async def memory_archive_search(request: Request):
     next_cursor = None
     if has_more and visible:
         next_cursor = _encode_archive_cursor(visible[-1]["occurred_at"], visible[-1]["event_id"])
-    return {"matches": visible, "next_cursor": next_cursor}
+    return {
+        "matches": [
+            _public_archive_record(row, _PUBLIC_ARCHIVE_EVENT_FIELDS)
+            for row in visible
+        ],
+        "next_cursor": next_cursor,
+    }
 
 
 @app.post("/memory/v1/memories/remember")
@@ -1843,8 +1894,18 @@ async def favicon():
 
 @app.post("/auth/verify")
 async def auth_verify(request: Request):
-    """兼容旧前端的探活端点。kiwi-mem 已移除访问密码，这里始终放行。"""
-    return {"status": "ok", "message": "无需密码"}
+    """Verify the tab-scoped admin Bearer secret against its configured digest."""
+    try:
+        authenticated = authenticate_admin_token(bearer_token(request.headers.get("authorization", "")))
+    except AdminTokenConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    if not authenticated:
+        raise HTTPException(
+            status_code=401,
+            detail="invalid admin bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return {"status": "ok", "message": "admin token verified"}
 
 
 @app.get("/api/status")

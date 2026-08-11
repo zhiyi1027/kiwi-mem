@@ -613,6 +613,15 @@ html[data-theme="dark"] .wiz-terminal { background:#0d0f08; border:1px solid var
 .archive-message header time { color:var(--text-faint); font-weight:400; }
 .archive-message > div { white-space:pre-wrap; overflow-wrap:anywhere; font-size:13px; line-height:1.65; }
 
+/* Admin authentication gate */
+.auth-gate { position:fixed; inset:0; z-index:5000; display:flex; align-items:center; justify-content:center; padding:20px; background:var(--bg); }
+.auth-card { width:min(420px,100%); display:flex; flex-direction:column; gap:12px; background:var(--surface); border:1px solid var(--border); border-radius:18px; padding:28px; box-shadow:var(--shadow-lg); }
+.auth-logo { width:46px; height:46px; display:flex; align-items:center; justify-content:center; border-radius:14px; font-size:25px; background:var(--surface-hover); }
+.auth-card h2 { font-size:18px; margin:2px 0 0; }
+.auth-card p { color:var(--text-muted); font-size:12.5px; line-height:1.65; margin:0 0 4px; }
+.auth-card label { color:var(--text-soft); font-size:12px; font-weight:700; }
+.auth-error { min-height:20px; color:var(--c-danger); font-size:12px; }
+
 ::-webkit-scrollbar { width:10px; height:10px; }
 ::-webkit-scrollbar-track { background:transparent; }
 ::-webkit-scrollbar-thumb { background:var(--border-strong); border-radius:8px; border:2px solid transparent; background-clip:content-box; }

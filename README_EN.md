@@ -78,11 +78,13 @@ No setup needed — isolation is automatic.
 
 ### 🪞 Multiple doors, one autobiographical self
 
-The standalone `/memory/v1` API can be shared by Codex, Claude Code, and future API clients. Each door has a different credential, but credentials only record where a request entered. The server assigns one `assistant_identity_id` and one `memory_space_id`, and clients cannot override them. Semantic memories use the assistant's first-person voice; machine provenance remains audit metadata and never enters recalled prose, handoff context, or identity narration.
+The standalone `/memory/v1` API can be shared by Codex, Claude Code, and future API clients. Each door has a different credential and the server stores SHA-256 digests only. Credentials only record where a request entered. The server assigns one `assistant_identity_id` and one `memory_space_id`, and clients cannot override them. Semantic memories use the assistant's first-person voice; machine provenance remains database audit metadata and is omitted from ordinary archive responses, recalled prose, handoff context, and identity narration.
 
 The same narrative contract covers automatic extraction, daily consolidation, Dream merge/softening, MemScenes, calendar summaries, and the user profile, and is appended after any custom prompt. Automatic extraction reads only the current session, so concurrent windows cannot be spliced into a conversation that never happened. Assistant memories use first person; facts about Zhizhi use “Zhizhi/she.” Invalid generated output is not stored and cannot retire its source memories first.
 
 The first-person contract governs the assistant's internal semantic memories only. The complete transcript archive is a shared external viewer, so its role labels are shown as “知知/Lyra” and “凛/Grey.”
+
+The admin UI and its data-bearing APIs use a separate Bearer secret. The server verifies only its `KIWI_ADMIN_TOKEN_SHA256` digest and the browser keeps the original secret in the current tab. Docker still binds to `127.0.0.1` by default; authentication is a second layer, not a substitute for a private network boundary.
 
 ---
 
@@ -132,11 +134,11 @@ Visit `http://localhost:8080` — if you see `{"status":"running"}`, you're good
 
 ### What's next
 
-- Visit `/admin` for the browser-based admin panel
+- Visit `/admin` for the browser-based admin panel; it prompts for the original admin secret whose digest is configured in `KIWI_ADMIN_TOKEN_SHA256`
 - Point your chat client's API endpoint to `http://localhost:8080/v1`
 - Works with any OpenAI-format frontend: ChatBox, NextChat, SillyTavern, or your own
 
-> 🔐 The shared-identity `/memory/v1/*` API requires its own Bearer credentials. The legacy chat gateway, admin panel, debug, and sync endpoints still have no built-in authentication. Keep the service on a private network or Tailscale, or protect the entire service with Cloudflare Access, reverse-proxy authentication, or an IP allowlist. Pay special attention to `/admin`, `/sync/export`, and `/sync/import-backup`; these legacy endpoints are not authenticated by kiwi-mem itself. Once complete transcript archiving is enabled, the service stores verbatim dialogue and must not be exposed directly to the public Internet. Docker Compose binds to `127.0.0.1` by default; set `KIWI_BIND_IP` to a private/Tailscale address for cross-host access.
+> 🔐 The shared-identity `/memory/v1/*` API uses per-door Bearer credentials. Admin, debug, Dream, calendar, and sync routes use a separate admin Bearer secret; the server stores SHA-256 digests only. The legacy chat gateway and MCP transport are still not public-Internet authentication boundaries, so keep the whole service on a private network/Tailscale or behind a strict reverse-proxy route allowlist. Once complete transcript archiving is enabled, do not expose the service directly to the public Internet. Docker Compose binds to `127.0.0.1` by default; set `KIWI_BIND_IP` to a private/Tailscale address for cross-host access.
 
 > 💡 80+ parameters can be changed at runtime via the admin panel — no restart needed.
 
@@ -267,7 +269,8 @@ Memory import is being rebuilt and will return in a future version in a smarter 
 | `KIWI_BIND_IP` | Docker host bind address | `127.0.0.1` |
 | `MEMORY_ASSISTANT_ID` | Assistant identity shared by every memory door | `grey_knox` |
 | `MEMORY_SPACE_ID` | Memory space shared by every memory door | `zhizhi_grey` |
-| `MEMORY_CLIENT_KEYS_JSON` | JSON map from door names to Bearer keys | — |
+| `MEMORY_CLIENT_KEY_DIGESTS_JSON` | JSON map from door names to Bearer-key SHA-256 digests | — |
+| `KIWI_ADMIN_TOKEN_SHA256` | SHA-256 digest of the admin Bearer secret | — |
 | `DEFAULT_MODEL` | Default chat model | `anthropic/claude-sonnet-4` |
 | `PORT` | Gateway port | `8080` |
 | `MAX_MEMORIES_INJECT` | Max memories per injection | `15` |
@@ -314,7 +317,7 @@ Memory import is being rebuilt and will return in a future version in a smarter 
 ### Memories
 | Path | Method | Description |
 |---|---|---|
-| `/memory/v1/whoami` | GET | Authenticate a door and return the canonical identity (Bearer required) |
+| `/memory/v1/whoami` | GET | Authenticate and return the canonical identity without naming the door (Bearer required) |
 | `/memory/v1/events/ingest` | POST | Idempotently append raw dialogue evidence (Bearer required) |
 | `/memory/v1/events/ingest-batch` | POST | Atomically replay up to 500 raw events after disconnect (Bearer required) |
 | `/memory/v1/archive/conversations` | GET | Cursor-page the archived conversation directory (Bearer required) |

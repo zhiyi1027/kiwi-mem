@@ -1,4 +1,4 @@
-// 🔐 认证与安全 — 说明为主：访问密码已移除、密钥脱敏。只读列出供应商 key 预览。
+// 🔐 认证与安全 — 管理密钥只按 SHA-256 摘要校验；供应商 key 只读脱敏。
 import { get, escHtml } from '../api.js';
 import { card, badge, emptyState, loadingBlock, toast } from '../ui.js';
 
@@ -10,25 +10,24 @@ export default {
       <p class="page-intro">这一页讲清 kiwi-mem 公开版的认证现状与密钥保护方式。本页仅作信息展示与只读核对，无任何破坏性操作。</p>
 
       <div class="banner banner-warn"><span>🔓</span><div>
-        <b>公开版已移除访问密码。</b> 后端 <code>/auth/verify</code> 始终放行——任何能访问到本服务地址的人都能使用。
-        如需保护，请把服务部署在<b>私有网络 / 反向代理鉴权</b>之后，不要把公网地址直接公开。
+        <b>管理控制面已启用 Bearer 认证。</b>服务端只配置 <code>KIWI_ADMIN_TOKEN_SHA256</code> 摘要，
+        原始密钥只保存在当前浏览器标签页。仍应部署在<b>私有网络</b>中，不要把完整聊天归档公开到公网。
       </div></div>
 
       ${card({
-        title: '① 前端访问密码',
+        title: '① 管理密钥',
         body: `<p class="muted" style="line-height:1.7;margin:0">
-          公开版<b>不再校验前端访问密码</b>（<code>/auth/verify</code> 恒返回「无需密码」）。
-          如需密码门禁，可在客户端或反向代理层自行处理，本网关本身不内置访问密码。
+          <code>/auth/verify</code> 会验证当前标签页提交的 Bearer 密钥。服务端保存的是 SHA-256 摘要，
+          不保存原始密钥，也没有公开的密钥轮换接口。
         </p>`,
       })}
 
       ${card({
-        title: '② 管理密钥',
+        title: '② 网络边界',
         cls: 'mt16',
         body: `<p class="muted" style="line-height:1.7;margin:0">
-          本管理面板与后端之间<b>不携带额外认证头</b>。若你的部署需要管理密钥，
-          应在<b>反向代理（如 Nginx / Caddy）或环境变量</b>层面施加，而非依赖前端。
-          切勿把可写的管理接口暴露到公网。
+          浏览器的所有管理请求都会携带认证头；MCP 的内部回环请求使用进程启动时随机生成的内部能力值。
+          应继续使用 <b>127.0.0.1 / Tailscale / 私网反向代理</b>，形成第二层边界。
         </p>`,
       })}
 

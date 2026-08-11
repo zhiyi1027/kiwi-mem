@@ -1,5 +1,5 @@
 // 💾 备份与数据 — 整体备份导出/导入 + 危险区重置（不做内容浏览，内容浏览交给客户端）
-import { del, download, API } from '../api.js';
+import { del, download, request } from '../api.js';
 import { loadingBlock, errorBlock, toast, confirmDialog, delegate, setBusy } from '../ui.js';
 
 export default {
@@ -47,8 +47,8 @@ export default {
     code.addEventListener('input', () => { btn.disabled = code.value.trim() !== 'RESET_ALL_DATA'; });
   },
 
-  doExport() {
-    try { download('/sync/export'); toast('已开始下载备份'); }
+  async doExport() {
+    try { await download('/sync/export'); toast('已开始下载备份'); }
     catch (e) { toast('导出失败：' + e.message, 'err'); }
   },
 
@@ -60,7 +60,7 @@ export default {
     const fd = new FormData();
     fd.append('file', file);
     try {
-      const res = await fetch(API + '/sync/import-backup', { method: 'POST', body: fd });
+      const res = await request('/sync/import-backup', { method: 'POST', body: fd });
       const data = await res.json().catch(() => ({}));
       if (!res.ok || data.error) throw new Error(data.error || `服务器错误 (${res.status})`);
       const n = (k) => data[k] ?? 0;

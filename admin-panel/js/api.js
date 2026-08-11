@@ -7,12 +7,22 @@
 // ============================================================
 
 export const API = window.location.origin;
+export const ADMIN_TOKEN_KEY = 'kiwi-admin-session-token';
+
+export function adminHeaders() {
+  const token = sessionStorage.getItem(ADMIN_TOKEN_KEY) || '';
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
 
 export async function request(path, { method = 'GET', body, headers, signal } = {}) {
-  const opts = { method, headers: { ...(headers || {}) }, signal };
+  const opts = { method, headers: { ...adminHeaders(), ...(headers || {}) }, signal };
   if (body !== undefined && body !== null) {
-    opts.headers['Content-Type'] = 'application/json';
-    opts.body = typeof body === 'string' ? body : JSON.stringify(body);
+    if (body instanceof FormData) {
+      opts.body = body;
+    } else {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = typeof body === 'string' ? body : JSON.stringify(body);
+    }
   }
   return fetch(API + path, opts);
 }
@@ -44,13 +54,24 @@ export const put  = (p, b) => jfetch(p, { method: 'PUT',    body: b ?? {} });
 export const del  = (p, b) => jfetch(p, { method: 'DELETE', ...(b !== undefined ? { body: b } : {}) });
 
 // 触发浏览器下载（GET）
-export function download(path) {
+export async function download(path) {
+  const res = await request(path);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data?.error || data?.detail || `服务器错误 (${res.status})`);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const disposition = res.headers.get('content-disposition') || '';
+  const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1] || 'kiwi-mem-backup.zip';
   const a = document.createElement('a');
-  a.href = API + path;
+  a.href = url;
+  a.download = filename;
   a.rel = 'noopener';
   document.body.appendChild(a);
   a.click();
   a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // SSE：POST 一个流式端点，逐事件回调。返回 {abort()}。
@@ -60,7 +81,7 @@ export function sse(path, body, onEvent, { onDone, onError } = {}) {
     try {
       const res = await fetch(API + path, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { ...adminHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify(body || {}),
         signal: ctrl.signal,
       });

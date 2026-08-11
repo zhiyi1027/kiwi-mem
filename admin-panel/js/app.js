@@ -12,11 +12,74 @@
 // ============================================================
 import { NAV, ROUTE_INDEX, LEDES } from './routes.js';
 import { errorBlock, loadingBlock } from './ui.js';
-import { get } from './api.js';
+import { ADMIN_TOKEN_KEY, get, request } from './api.js';
 import { initSearch, tryHighlight } from './search.js';
 import { maybeShowWizard } from './wizard.js';
 
 const DEFAULT_ROUTE = 'dashboard';
+
+async function verifyAdminToken(token) {
+  const res = await request('/auth/verify', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (res.ok) return { ok: true, message: '' };
+  const data = await res.json().catch(() => ({}));
+  return { ok: false, message: data?.detail || `认证失败 (${res.status})` };
+}
+
+async function requireAdminLogin() {
+  const saved = sessionStorage.getItem(ADMIN_TOKEN_KEY) || '';
+  if (saved) {
+    const result = await verifyAdminToken(saved);
+    if (result.ok) return;
+    sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+  }
+
+  const gate = document.createElement('div');
+  gate.className = 'auth-gate';
+  gate.innerHTML = `
+    <form class="auth-card">
+      <div class="auth-logo">🥝</div>
+      <h2>进入 Kiwi-Mem 管理面板</h2>
+      <p>输入管理密钥。密钥只保存在当前标签页，关闭后自动清除。</p>
+      <label for="admin-token">管理密钥</label>
+      <input id="admin-token" type="password" autocomplete="current-password" required autofocus>
+      <div id="auth-error" class="auth-error" aria-live="polite"></div>
+      <button class="btn btn-primary" type="submit">验证并进入</button>
+    </form>`;
+  document.body.appendChild(gate);
+
+  await new Promise(resolve => {
+    const form = gate.querySelector('form');
+    const input = gate.querySelector('#admin-token');
+    const error = gate.querySelector('#auth-error');
+    const button = gate.querySelector('button');
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      const token = input.value.trim();
+      if (!token) return;
+      button.disabled = true;
+      button.textContent = '验证中…';
+      error.textContent = '';
+      try {
+        const result = await verifyAdminToken(token);
+        if (!result.ok) {
+          error.textContent = result.message;
+          return;
+        }
+        sessionStorage.setItem(ADMIN_TOKEN_KEY, token);
+        gate.remove();
+        resolve();
+      } catch (e) {
+        error.textContent = e.message || '无法连接后端';
+      } finally {
+        button.disabled = false;
+        button.textContent = '验证并进入';
+      }
+    });
+  });
+}
 
 // 已从管理面板移除的旧路由 → key:中文名。命中后给明确提示，不再静默跳仪表盘。
 const REMOVED = {
@@ -149,12 +212,17 @@ function openSidebar()  { document.getElementById('sidebar')?.classList.add('ope
 function closeSidebar() { document.getElementById('sidebar')?.classList.remove('open'); document.getElementById('sb-backdrop')?.classList.remove('show'); }
 
 // ---------- 启动 ----------
-function boot() {
+async function boot() {
   initTheme();
+  await requireAdminLogin();
   renderSidebar();
   initSearch(document.getElementById('global-search'));
   document.getElementById('theme-btn')?.addEventListener('click', () => {
     applyTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+  });
+  document.getElementById('lock-btn')?.addEventListener('click', () => {
+    sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+    location.reload();
   });
   document.getElementById('menu-btn')?.addEventListener('click', openSidebar);
   document.getElementById('sb-backdrop')?.addEventListener('click', closeSidebar);
@@ -165,4 +233,7 @@ function boot() {
   maybeShowWizard(); // 首次使用 & 没有供应商时弹三步向导（可跳过）
 }
 
-boot();
+boot().catch(error => {
+  console.error(error);
+  document.getElementById('content').innerHTML = errorBlock(`管理面板启动失败：${error.message}`);
+});
