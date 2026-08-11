@@ -48,7 +48,7 @@ async def search_memory(query: str, limit: int = 10, include_archived: bool = Fa
     搜索记忆 — 用自然语言描述你想找的内容，向量语义搜索会返回最相关的记忆。
 
     参数：
-    - query: 搜索关键词或自然语言描述，比如"用户的健康记录"、"上周聊了什么"
+    - query: 搜索关键词或自然语言描述，比如"知知的健康记录"、"上周聊了什么"
     - limit: 返回条数上限（默认10，最大50）
     - include_archived: 是否显式搜索已退出日常召回的冷记忆和历史版本
 
@@ -96,16 +96,17 @@ async def search_memory(query: str, limit: int = 10, include_archived: bool = Fa
 
 
 @mcp_memory.tool()
-async def save_memory(content: str, title: str = "", importance: int = 5) -> str:
+async def save_memory(content: str, title: str = "", importance: int = 5, memory_kind: str = "") -> str:
     """
     [category: memory]
 
     保存一条新记忆到记忆库。
 
     参数：
-    - content: 记忆内容（必填），比如"用户今天搬到了新城市"
+    - content: 记忆内容（必填），关于知知写“知知/她”，关于我的承诺和共同经历写“我”
     - title: 标题（可选，4-10字概括），比如"台湾搬家"
     - importance: 重要度 1-10（默认5），日常琐事1-4，重要事件5-6，关键转折7-8，核心记忆9-10
+    - memory_kind: user_fact / relationship / self / neutral；留空时自动判断
 
     记忆保存后会自动生成向量，可以被语义搜索找到。
     """
@@ -125,6 +126,7 @@ async def save_memory(content: str, title: str = "", importance: int = 5) -> str
                     "content": content.strip(),
                     "title": title.strip(),
                     "importance": importance,
+                    "memory_kind": memory_kind.strip(),
                 },
             )
             data = resp.json()

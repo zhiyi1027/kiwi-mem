@@ -30,6 +30,8 @@ import httpx
 import jieba
 import jieba.analyse
 
+from memory_identity import prepare_generated_memory, prepare_scene_fields
+
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 CANONICAL_ASSISTANT_ID = os.getenv("MEMORY_ASSISTANT_ID", "grey_knox").strip() or "grey_knox"
 CANONICAL_MEMORY_SPACE_ID = os.getenv("MEMORY_SPACE_ID", "zhizhi_grey").strip() or "zhizhi_grey"
@@ -423,6 +425,8 @@ async def init_tables():
         if not has_scene_embedding:
             await conn.execute("ALTER TABLE mem_scenes ADD COLUMN embedding JSONB DEFAULT NULL")
             print("✅ mem_scenes 已添加 embedding 列")
+        await conn.execute("ALTER TABLE mem_scenes ADD COLUMN IF NOT EXISTS memory_space_id TEXT NOT NULL DEFAULT 'zhizhi_grey'")
+        await conn.execute("ALTER TABLE mem_scenes ADD COLUMN IF NOT EXISTS assistant_identity_id TEXT NOT NULL DEFAULT 'grey_knox'")
 
         # v5.1：Dream 执行记录表
         await conn.execute("""
@@ -1056,6 +1060,18 @@ async def get_recent_conversation(limit: int = 20):
         return list(reversed(rows))
 
 
+async def get_latest_conversation_session_id() -> str | None:
+    """Return one latest session for manual extraction without mixing windows."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            """SELECT session_id FROM conversations
+               WHERE superseded_at IS NULL
+               ORDER BY created_at DESC, id DESC
+               LIMIT 1"""
+        )
+
+
 async def get_handoff_source(exclude_conversation_id: str = None, project_id: str = None):
     """Return the latest eligible conversation for seamless handoff."""
     pool = await get_pool()
@@ -1149,6 +1165,11 @@ async def save_memory(
     memory_space_id: str = CANONICAL_MEMORY_SPACE_ID,
     assistant_identity_id: str = CANONICAL_ASSISTANT_ID,
     source_client: str = None,
+    memory_kind: str = None,
+    enforce_identity: bool = False,
+    memory_type: str = "fragment",
+    dream_processed_at: datetime = None,
+    created_at: datetime = None,
 ) -> int:
     """
     存储新记忆，自动生成 embedding 向量
@@ -1165,6 +1186,13 @@ async def save_memory(
     
     返回：新记忆的 ID（v5.3）
     """
+    if enforce_identity:
+        prepared, voice_errors = prepare_generated_memory(content, title, memory_kind)
+        if voice_errors:
+            raise ValueError(f"generated memory violates identity contract: {'; '.join(voice_errors)}")
+        content = prepared["content"]
+        title = prepared["title"]
+
     # 生成 embedding（title + content 合并生成，提升语义搜索精度）
     embed_text = f"{title} {content}" if title else content
     embedding = await get_embedding(embed_text)
@@ -1177,13 +1205,15 @@ async def save_memory(
                 INSERT INTO memories (
                     content, importance, source_session, embedding, title,
                     category_id, source, emotional_weight, project_id,
-                    memory_space_id, assistant_identity_id, source_client
+                    memory_space_id, assistant_identity_id, source_client,
+                    memory_type, dream_processed_at, created_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, COALESCE($15, NOW()))
                 RETURNING id
             """, content, importance, source_session, embedding_json, title,
                  category_id, source, emotional_weight, project_id,
-                 memory_space_id, assistant_identity_id, source_client)
+                 memory_space_id, assistant_identity_id, source_client,
+                 memory_type, dream_processed_at, created_at)
             await conn.execute("""
                 INSERT INTO memory_versions
                     (memory_id, version, content, title, resolution, embedding, change_type)
@@ -1975,6 +2005,12 @@ async def soften_memory(memory_id: int, softened_content: str, target_resolution
             return False
         softened_content = cleaned_content
         title = row["title"] or ""
+        prepared, voice_errors = prepare_generated_memory(softened_content, title)
+        if voice_errors:
+            print(f"   🚫 软化跳过: #{memory_id} 违反身份叙述契约: {voice_errors}")
+            return False
+        softened_content = prepared["content"]
+        title = prepared["title"]
         embed_text = f"{title} {softened_content}" if title else softened_content
         embedding = await get_embedding(embed_text)
         embedding_json = json.dumps(embedding) if embedding else None
@@ -2269,7 +2305,12 @@ async def _keyword_search(
 # 常用查询
 # ============================================================
 
-async def get_recent_memories(limit: int = 20, category_id: int = None, project_id: str = None):
+async def get_recent_memories(
+    limit: int = 20,
+    category_id: int = None,
+    project_id: str = None,
+    memory_space_id: str = CANONICAL_MEMORY_SPACE_ID,
+):
     """
     最近记忆。
     project_id 语义（保持与本函数原有调用方一致）：
@@ -2288,7 +2329,8 @@ async def get_recent_memories(limit: int = 20, category_id: int = None, project_
            WHERE COALESCE(m.memory_type, 'fragment') NOT IN ('digested', 'dream_deleted')
              AND (m.valid_until IS NULL OR m.valid_until > NOW())"""
     params: list = []
-    where_extra = ""
+    params.append(memory_space_id)
+    where_extra = " AND m.memory_space_id = $1"
     if category_id is not None:
         params.append(category_id)
         where_extra += f" AND m.category_id = ${len(params)}"
@@ -2335,7 +2377,13 @@ async def get_memories_count(category_id: int = None, project_id: str = None):
 # 记忆去重检测
 # ============================================================
 
-async def check_memory_duplicate(new_content: str, threshold: float = None, new_title: str = "", project_id: str = None):
+async def check_memory_duplicate(
+    new_content: str,
+    threshold: float = None,
+    new_title: str = "",
+    project_id: str = None,
+    memory_space_id: str = CANONICAL_MEMORY_SPACE_ID,
+):
     """
     检查新记忆是否与已有记忆重复（v5.4：标题不同时不判重复）
 
@@ -2361,13 +2409,13 @@ async def check_memory_duplicate(new_content: str, threshold: float = None, new_
     async with pool.acquire() as conn:
         if project_id:
             exact_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM memories WHERE content = $1 AND project_id = $2",
-                new_content, project_id,
+                "SELECT COUNT(*) FROM memories WHERE content = $1 AND project_id = $2 AND memory_space_id = $3",
+                new_content, project_id, memory_space_id,
             )
         else:
             exact_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM memories WHERE content = $1 AND project_id IS NULL",
-                new_content,
+                "SELECT COUNT(*) FROM memories WHERE content = $1 AND project_id IS NULL AND memory_space_id = $2",
+                new_content, memory_space_id,
             )
         if exact_count > 0:
             print(f"🔄 精确重复，跳过: {new_content[:60]}...")
@@ -2375,7 +2423,13 @@ async def check_memory_duplicate(new_content: str, threshold: float = None, new_
 
     # 第2层 + 第3层：先用向量搜索找候选，再做精确对比
     try:
-        similar = await search_memories(new_content, limit=15, track_recall=False, project_id=project_id)
+        similar = await search_memories(
+            new_content,
+            limit=15,
+            track_recall=False,
+            project_id=project_id,
+            memory_space_id=memory_space_id,
+        )
     except Exception:
         return False, []
     
@@ -3803,8 +3857,22 @@ async def _get_scene_embedding_json(title: str, atomic_facts, scene_label: str =
 
 async def create_mem_scene(title: str, narrative: str, atomic_facts: list = None,
                             foresight: list = None, related_memory_ids: list = None,
-                            dream_id: int = None):
+                            dream_id: int = None,
+                            memory_space_id: str = CANONICAL_MEMORY_SPACE_ID,
+                            assistant_identity_id: str = CANONICAL_ASSISTANT_ID):
     """创建记忆场景"""
+    prepared, voice_errors = prepare_scene_fields(
+        title=title,
+        narrative=narrative,
+        atomic_facts=atomic_facts or [],
+        foresight=foresight or [],
+    )
+    if voice_errors:
+        raise ValueError(f"generated scene violates identity contract: {'; '.join(voice_errors)}")
+    title = prepared["title"]
+    narrative = prepared["narrative"]
+    atomic_facts = prepared["atomic_facts"]
+    foresight = prepared["foresight"]
     pool = await get_pool()
     af = json.dumps(atomic_facts or [], ensure_ascii=False)
     fs = json.dumps(foresight or [], ensure_ascii=False)
@@ -3812,23 +3880,37 @@ async def create_mem_scene(title: str, narrative: str, atomic_facts: list = None
     embedding_json = await _get_scene_embedding_json(title, atomic_facts, f"scene:{title or 'untitled'}")
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            INSERT INTO mem_scenes (title, narrative, atomic_facts, foresight, related_memory_ids, created_by_dream_id, embedding)
-            VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6, $7::jsonb)
+            INSERT INTO mem_scenes (title, narrative, atomic_facts, foresight, related_memory_ids,
+                                    created_by_dream_id, embedding, memory_space_id, assistant_identity_id)
+            VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6, $7::jsonb, $8, $9)
             RETURNING id
-        """, title, narrative, af, fs, rm, dream_id, embedding_json)
+        """, title, narrative, af, fs, rm, dream_id, embedding_json,
+             memory_space_id, assistant_identity_id)
     return row["id"] if row else None
 
 
-async def update_mem_scene(scene_id: int, **kwargs):
+async def update_mem_scene(scene_id: int, memory_space_id: str = CANONICAL_MEMORY_SPACE_ID, **kwargs):
     """更新记忆场景"""
+    identity_fields = {key: kwargs[key] for key in ("title", "narrative", "atomic_facts", "foresight") if key in kwargs}
+    if identity_fields:
+        prepared, voice_errors = prepare_scene_fields(
+            title=identity_fields.get("title", ""),
+            narrative=identity_fields.get("narrative") if "narrative" in identity_fields else None,
+            atomic_facts=identity_fields.get("atomic_facts") if "atomic_facts" in identity_fields else None,
+            foresight=identity_fields.get("foresight") if "foresight" in identity_fields else None,
+        )
+        if voice_errors:
+            raise ValueError(f"generated scene update violates identity contract: {'; '.join(voice_errors)}")
+        for key in identity_fields:
+            kwargs[key] = prepared[key]
     pool = await get_pool()
     refresh_embedding = any(key in kwargs for key in ("title", "atomic_facts"))
     embedding_json = None
     if refresh_embedding:
         async with pool.acquire() as conn:
             current = await conn.fetchrow(
-                "SELECT title, atomic_facts FROM mem_scenes WHERE id = $1",
-                scene_id,
+                "SELECT title, atomic_facts FROM mem_scenes WHERE id = $1 AND memory_space_id = $2",
+                scene_id, memory_space_id,
             )
         if not current:
             return False
@@ -3855,7 +3937,9 @@ async def update_mem_scene(scene_id: int, **kwargs):
         return False
     sets.append(f"updated_at = NOW()")
     vals.append(scene_id)
-    sql = f"UPDATE mem_scenes SET {', '.join(sets)} WHERE id = ${idx}"
+    idx += 1
+    vals.append(memory_space_id)
+    sql = f"UPDATE mem_scenes SET {', '.join(sets)} WHERE id = ${idx - 1} AND memory_space_id = ${idx}"
     async with pool.acquire() as conn:
         await conn.execute(sql, *vals)
     return True
@@ -3866,7 +3950,8 @@ async def get_active_scenes():
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT * FROM mem_scenes WHERE status = 'active' ORDER BY updated_at DESC"
+            "SELECT * FROM mem_scenes WHERE status = 'active' AND memory_space_id = $1 ORDER BY updated_at DESC",
+            CANONICAL_MEMORY_SPACE_ID,
         )
     return [dict(r) for r in rows]
 
@@ -3883,7 +3968,8 @@ async def search_scenes(query_embedding: list, limit: int = 2, min_sim: float = 
             FROM mem_scenes
             WHERE status = 'active'
               AND embedding IS NOT NULL
-        """)
+              AND memory_space_id = $1
+        """, CANONICAL_MEMORY_SPACE_ID)
 
     matches = []
     for row in rows:
@@ -3922,8 +4008,9 @@ async def get_unprocessed_memories():
               AND COALESCE(is_permanent, false) = FALSE
               AND (valid_until IS NULL OR valid_until > NOW())
               AND project_id IS NULL
+              AND memory_space_id = $1
             ORDER BY created_at ASC
-        """)
+        """, CANONICAL_MEMORY_SPACE_ID)
     return [dict(r) for r in rows]
 
 
@@ -3957,6 +4044,7 @@ async def get_aging_memories(min_age_days: int = 5, limit: int = 20, cooldown_da
               AND COALESCE(resolution, 1.0) > 0.3
               AND importance < 8
               AND project_id IS NULL
+              AND memory_space_id = $4
               AND created_at < NOW() - $1 * INTERVAL '1 day'
               AND (
                     softened_at IS NULL
@@ -3964,7 +4052,7 @@ async def get_aging_memories(min_age_days: int = 5, limit: int = 20, cooldown_da
               )
             ORDER BY created_at ASC
             LIMIT $2
-        """, min_age_days, limit, cooldown_days)
+        """, min_age_days, limit, cooldown_days, CANONICAL_MEMORY_SPACE_ID)
     return [dict(r) for r in rows]
 
 
@@ -3986,9 +4074,10 @@ async def get_permanent_memories(project_id: str = None):
             WHERE is_permanent = TRUE
               AND (valid_until IS NULL OR valid_until > NOW())
               AND (project_id IS NULL OR project_id = $1)
+              AND memory_space_id = $2
             ORDER BY created_at ASC
             """,
-            project_id,
+            project_id, CANONICAL_MEMORY_SPACE_ID,
         )
     return [dict(r) for r in rows]
 
@@ -4001,8 +4090,8 @@ async def mark_memories_dreamed(memory_ids: list):
     async with pool.acquire() as conn:
         await conn.execute("""
             UPDATE memories SET dream_processed_at = NOW()
-            WHERE id = ANY($1::int[])
-        """, memory_ids)
+            WHERE id = ANY($1::int[]) AND memory_space_id = $2
+        """, memory_ids, CANONICAL_MEMORY_SPACE_ID)
 
 
 async def soft_delete_memories(memory_ids: list):
@@ -4017,8 +4106,8 @@ async def soft_delete_memories(memory_ids: list):
                 valid_until = COALESCE(valid_until, NOW()),
                 archived_at = COALESCE(archived_at, NOW()),
                 archive_reason = COALESCE(archive_reason, 'dream_archived')
-            WHERE id = ANY($1::int[])
-        """, memory_ids)
+            WHERE id = ANY($1::int[]) AND memory_space_id = $2
+        """, memory_ids, CANONICAL_MEMORY_SPACE_ID)
 
 
 async def promote_memory(memory_id: int):
@@ -4026,7 +4115,8 @@ async def promote_memory(memory_id: int):
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE memories SET is_permanent = TRUE, lock_source = 'dream' WHERE id = $1", memory_id
+            "UPDATE memories SET is_permanent = TRUE, lock_source = 'dream' WHERE id = $1 AND memory_space_id = $2",
+            memory_id, CANONICAL_MEMORY_SPACE_ID,
         )
 
 

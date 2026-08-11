@@ -80,6 +80,8 @@ No setup needed — isolation is automatic.
 
 The standalone `/memory/v1` API can be shared by Codex, Claude Code, and future API clients. Each door has a different credential, but credentials only record where a request entered. The server assigns one `assistant_identity_id` and one `memory_space_id`, and clients cannot override them. Semantic memories use the assistant's first-person voice; machine provenance remains audit metadata and never enters recalled prose, handoff context, or identity narration.
 
+The same narrative contract covers automatic extraction, daily consolidation, Dream merge/softening, MemScenes, calendar summaries, and the user profile, and is appended after any custom prompt. Automatic extraction reads only the current session, so concurrent windows cannot be spliced into a conversation that never happened. Assistant memories use first person; facts about Zhizhi use “Zhizhi/she.” Invalid generated output is not stored and cannot retire its source memories first.
+
 ---
 
 ## Who is it for

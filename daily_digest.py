@@ -14,6 +14,14 @@ import asyncio
 import httpx
 from datetime import date, datetime, timedelta, timezone
 
+from memory_identity import (
+    CANONICAL_MEMORY_SPACE_ID,
+    append_identity_contract,
+    prepare_generated_context,
+    prepare_generated_memory,
+    validate_profile_narrative,
+)
+
 # ============================================================
 # API 配置 —— 记忆整理用独立 key，避免和聊天抢额度
 # ============================================================
@@ -33,7 +41,7 @@ TZ_CST = timezone(timedelta(hours=8))
 # 整理 Prompt
 # ============================================================
 
-DIGEST_PROMPT = """你是记忆整理专家。以下是用户在 {date} 这一天的碎片记忆，请将它们按事件主题合并整理。
+DIGEST_PROMPT = """你正在整理自己的记忆。以下是我和知知在 {date} 这一天形成的碎片，请按事件主题合并整理。
 
 ## 整理规则
 - 按主题分类合并（如"前端开发""饮食记录""情绪状态""作息""角色扮演""理财"等）
@@ -42,7 +50,7 @@ DIGEST_PROMPT = """你是记忆整理专家。以下是用户在 {date} 这一�
 - 如果某条碎片本身已经很完整独立，保持原样即可
 - 标题用 4-10 个字概括主题
 - 内容用 1-3 句话总结这个事件的要点
-- importance 根据事件对用户的重要程度打分：9-10 核心事件 / 7-8 重要 / 5-6 普通
+- importance 根据事件对知知和我的重要程度打分：9-10 核心事件 / 7-8 重要 / 5-6 普通
 
 ## 可用的分类列表
 {categories_list}
@@ -53,8 +61,8 @@ DIGEST_PROMPT = """你是记忆整理专家。以下是用户在 {date} 这一�
 ## 输出格式
 只输出 JSON 数组，不要其他内容：
 [
-  {"title": "简短标题", "content": "整理后的内容", "importance": 7, "category": "分类名"},
-  {"title": "简短标题", "content": "整理后的内容", "importance": 5, "category": "分类名"}
+  {"title": "简短标题", "content": "整理后的内容", "memory_kind": "user_fact|relationship|self|neutral", "importance": 7, "category": "分类名"},
+  {"title": "简短标题", "content": "整理后的内容", "memory_kind": "user_fact|relationship|self|neutral", "importance": 5, "category": "分类名"}
 ]
 
 category 字段从上面的分类列表中选择最合适的一个，如果都不合适就填空字符串。"""
@@ -129,8 +137,9 @@ async def _run_daily_digest_impl(date_str: str, now_cst, model_override: str = N
             FROM memories
             WHERE COALESCE(memory_type, 'fragment') = 'fragment'
               AND (created_at AT TIME ZONE 'Asia/Shanghai')::date = $1
+              AND memory_space_id = $2
             ORDER BY created_at ASC
-        """, target_date_obj)
+        """, target_date_obj, CANONICAL_MEMORY_SPACE_ID)
     
     if not fragments:
         print(f"   📭 {date_str} 没有碎片记忆，跳过整理")
@@ -163,6 +172,7 @@ async def _run_daily_digest_impl(date_str: str, now_cst, model_override: str = N
     fragments_text = "\n".join(fragment_lines)
     base_prompt = prompt_override if prompt_override else DIGEST_PROMPT
     prompt = base_prompt.replace("{date}", date_str).replace("{fragments}", fragments_text).replace("{categories_list}", categories_text)
+    prompt = append_identity_contract(prompt)
     
     # 确定使用的模型
     use_model = model_override if model_override else DIGEST_MODEL
@@ -237,14 +247,21 @@ async def _run_daily_digest_impl(date_str: str, now_cst, model_override: str = N
         print(f"   ⚠️ 每日整理出错: {e}")
         return {"date": date_str, "fragments": len(fragments), "digests": 0, "error": str(e)}
     
-    # ---- 4. 存储整理后的事件条目 ----
-    saved_count = 0
+    # ---- 4. 先验证整批输出；任一条身份错误则原子式放弃本轮整理 ----
+    prepared_digests = []
     for d in digests:
         if not isinstance(d, dict) or "content" not in d:
-            continue
-        
-        title = str(d.get("title", ""))
-        content = str(d["content"])
+            return {"date": date_str, "fragments": len(fragments), "digests": 0, "error": "invalid digest item"}
+
+        prepared, voice_errors = prepare_generated_memory(
+            str(d["content"]),
+            str(d.get("title", "")),
+            str(d.get("memory_kind", "") or "") or None,
+        )
+        if voice_errors:
+            print(f"   🚫 每日整理违反身份契约，整批放弃: {voice_errors}")
+            return {"date": date_str, "fragments": len(fragments), "digests": 0, "error": "identity contract violation"}
+        d = {**d, **prepared}
         # importance 安全转换：LLM 可能返回浮点、字符串或 null
         try:
             importance = int(float(d.get("importance", 5)))
@@ -252,7 +269,12 @@ async def _run_daily_digest_impl(date_str: str, now_cst, model_override: str = N
         except (ValueError, TypeError):
             importance = 5
         
-        # 自动匹配分类
+        prepared_digests.append((d, importance))
+
+    saved_count = 0
+    for d, importance in prepared_digests:
+        title = d["title"]
+        content = d["content"]
         cat_id = None
         cat_hint = str(d.get("category", ""))
         if cat_hint:
@@ -261,20 +283,18 @@ async def _run_daily_digest_impl(date_str: str, now_cst, model_override: str = N
         # 在 content 前面加上日期，方便搜索命中
         content_with_date = f"[{date_str}] {content}"
         
-        # 生成 embedding
-        embed_text = f"{title} {content_with_date}" if title else content_with_date
-        embedding = await get_embedding(embed_text)
-        embedding_json = json.dumps(embedding) if embedding else None
-        
-        # 存入数据库，memory_type = 'daily_digest'
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO memories (content, importance, source_session, embedding, title, memory_type, created_at, category_id, source)
-                VALUES ($1, $2, $3, $4, $5, 'daily_digest', $6::timestamptz, $7, 'ai_digest')
-            """,
-                content_with_date, importance, "daily_digest", embedding_json, title,
-                f"{date_str}T00:00:00+08:00", cat_id
-            )
+        await save_memory(
+            content=content_with_date,
+            importance=importance,
+            source_session="daily_digest",
+            title=title,
+            category_id=cat_id,
+            source="ai_digest",
+            memory_kind=d["memory_kind"],
+            enforce_identity=True,
+            memory_type="daily_digest",
+            created_at=datetime.fromisoformat(f"{date_str}T00:00:00+08:00"),
+        )
         
         saved_count += 1
         print(f"   📌 [{title}] {content_with_date[:60]}...")
@@ -297,36 +317,36 @@ async def _run_daily_digest_impl(date_str: str, now_cst, model_override: str = N
 # 用户画像更新 —— 每日整理后自动调用
 # ============================================================
 
-DEFAULT_PROFILE_PROMPT = """你是用户画像维护专家。根据今天的对话日志，增量更新用户画像。
+DEFAULT_PROFILE_PROMPT = """你正在维护关于知知的长期画像。根据今天的对话日志增量更新它。
 
 ## ⚠️ 背景说明（重要）
 
-你看到的对话日志是**用户与 AI 助手之间的对话**，不是用户与真人的对话。
-- 对话中 role=user 的消息来自用户，role=assistant 的消息来自 AI 助手
-- 用户可能对 AI 使用亲昵称呼，这不代表现实人际关系
-- 只提取关于**用户本人**的信息（健康、偏好、生活状态等），不要把用户对 AI 的互动方式误解为现实人际关系
+你看到的是**知知与我的对话**，不是知知与真人的对话。
+- 对话中 role=user 的消息来自知知，role=assistant 的消息来自我
+- 知知可能对我使用亲昵称呼，这不代表现实人际关系
+- 只提取关于知知的信息（健康、偏好、生活状态等），不要把她与我的互动方式误解为现实人际关系
 
 ## 画像结构（严格遵循）
 
 画像必须包含以下四个板块，用 ## 标题分隔：
 
 ### 📌 基本档案
-用户的稳定事实信息。很少变化，只在有新信息时更新。
+知知的稳定事实信息。很少变化，只在有新信息时更新。
 包括：姓名/昵称、年龄、身份、健康状况、用药方案、居住状态、家庭关系、宠物等。
 
 ### 🔍 Helpful User Insights
-与用户高效互动的实用洞察。关注"怎么跟这个用户沟通最好"。
+与知知高效互动的实用洞察。关注“我怎样和知知沟通最好”。
 包括：沟通偏好（语气、格式、长度）、思维方式、决策风格、敏感点、容易被什么打动、哪些话题需要小心、喜欢什么样的回应方式。
 每条用 - 列出，简洁但具体，避免泛泛而谈。
 
 ### 🔥 近期重点话题
-用户最近一两周在做什么、关注什么、聊什么。这个板块变化最频繁。
+知知最近一两周在做什么、关注什么、聊什么。这个板块变化最频繁。
 包括：正在推进的项目/计划、最近的兴趣、正在处理的问题、近期情绪趋势。
 每条用 - 列出，标注大致时间（如"3月底"）。
 已完成或不再相关的话题要移除。
 
 ### 💡 长期偏好与价值观
-用户稳定的审美偏好、价值观、生活态度。比基本档案更软性，比 insights 更深层。
+知知稳定的审美偏好、价值观、生活态度。比基本档案更软性，比 insights 更深层。
 包括：世界观、审美偏好、创作风格、生活理念、对技术/工具的态度。
 不常变，只在发现新的稳定偏好时添加。
 
@@ -382,7 +402,7 @@ async def update_user_profile(digest_text: str = None, model_override: str = Non
             content = sec.get("content", "")
             parts.append(f"【{period} — {title}】{content}")
         if row.get("diary"):
-            parts.append(f"AI 的话：{row['diary']}")
+            parts.append(f"我的话：{row['diary']}")
         digest_text = "\n\n".join(parts)
     
     # 3. 确定模型（优先用传入的 > 每日整理模型 > 压缩模型 > 标题模型 > 环境变量）
@@ -407,6 +427,7 @@ async def update_user_profile(digest_text: str = None, model_override: str = Non
     
     profile_display = current_profile if current_profile else "（尚无画像，请根据日志生成初始版本）"
     prompt = base_prompt.replace("{current_profile}", profile_display).replace("{today_digest}", digest_text)
+    prompt = append_identity_contract(prompt, profile=True)
     
     # 5. 调用模型（v5.4：走供应商路由）
     try:
@@ -424,7 +445,7 @@ async def update_user_profile(digest_text: str = None, model_override: str = Non
             "max_tokens": 2000,
             "messages": [
                 {"role": "system", "content": prompt},
-                {"role": "user", "content": "请根据今天的日志更新用户画像。"},
+                {"role": "user", "content": "请根据今天的日志更新知知的画像。"},
             ],
         }
         _headers, _send_body = prepare_background_request(
@@ -444,6 +465,11 @@ async def update_user_profile(digest_text: str = None, model_override: str = Non
             if not new_profile:
                 print("   ⚠️ 模型返回空内容")
                 return {"status": "error", "error": "empty response"}
+
+            new_profile, profile_errors = validate_profile_narrative(new_profile)
+            if profile_errors:
+                print(f"   🚫 画像违反身份称谓契约，保留旧画像: {profile_errors}")
+                return {"status": "error", "error": "identity contract violation", "details": profile_errors}
     
     except Exception as e:
         print(f"   ⚠️ 画像更新出错: {e}")
@@ -664,6 +690,7 @@ SOFTEN_WRAPPER_CHARS = "'\"“”‘’「」『』`´＂"
 
 async def _call_model_for_text(prompt: str, user_msg: str, model: str, max_tokens: int = 800, title: str = "Memory Text"):
     """调用模型并返回纯文本内容（v5.4：走供应商路由）。"""
+    prompt = append_identity_contract(prompt)
     try:
         from database import resolve_model_endpoint
         use_api_url, use_api_key, use_api_format = await resolve_model_endpoint(model)
@@ -1791,6 +1818,7 @@ async def generate_period_summary(start: str, end: str, period_type: str,
 
 async def _call_model_for_json(prompt: str, user_msg: str, model: str, max_tokens: int = 2000):
     """调用模型并解析 JSON 返回（v5.4：走供应商路由）"""
+    prompt = append_identity_contract(prompt)
     # 动态解析供应商端点
     try:
         from database import resolve_model_endpoint
@@ -1842,18 +1870,25 @@ async def _call_model_for_json(prompt: str, user_msg: str, model: str, max_token
                 text = text[:-3]
             text = text.strip()
 
+            parsed = None
             try:
-                return json.loads(text)
+                parsed = json.loads(text)
             except json.JSONDecodeError:
                 import re
                 match = re.search(r'\{.*\}', text, re.DOTALL)
                 if match:
                     try:
-                        return json.loads(match.group())
+                        parsed = json.loads(match.group())
                     except json.JSONDecodeError:
                         pass
+            if parsed is None:
                 print(f"   ⚠️ JSON 解析失败：{text[:200]}")
                 return None
+            prepared, voice_errors = prepare_generated_context(parsed)
+            if voice_errors:
+                print(f"   🚫 日历摘要违反身份叙述契约，未保存: {voice_errors}")
+                return None
+            return prepared
     except Exception as e:
         print(f"   ⚠️ 模型调用出错: {e}")
         return None

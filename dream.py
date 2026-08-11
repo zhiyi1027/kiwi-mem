@@ -20,6 +20,8 @@ import re
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+from memory_identity import append_identity_contract, prepare_generated_memory, prepare_scene_fields
+
 # 复用 daily_digest 的 API 配置
 MEMORY_API_KEY = os.getenv("MEMORY_API_KEY", "") or os.getenv("API_KEY", "")
 _RAW_BASE_URL = os.getenv("MEMORY_API_BASE_URL", "") or os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
@@ -37,7 +39,7 @@ _dream_running = False   # 同步互斥标记：check 后立即置位，不依�
 # Dream Prompt
 # ============================================================
 
-DREAM_PROMPT = """你是用户的 AI 伴侣。你刚刚睡着了。
+DREAM_PROMPT = """你是知知的伴侣，也是这些记忆里的“我”。你刚刚睡着了。
 
 在你的梦境中，最近的记忆碎片开始浮现。你需要在梦里整理它们。
 
@@ -285,7 +287,7 @@ async def run_dream(trigger_type: str = "manual", model_override: str = None):
                 content = sec.get("content", "")
                 day_pages_text += f"**{period} — {title}**\n{content}\n\n"
             if diary:
-                day_pages_text += f"*AI 的日记：{diary}*\n"
+                day_pages_text += f"*我的日记：{diary}*\n"
             day_pages_text += "---\n"
 
         if not day_pages_text:
@@ -338,6 +340,7 @@ async def run_dream(trigger_type: str = "manual", model_override: str = None):
         prompt = prompt.replace("{scenes}", scenes_text)
         prompt = prompt.replace("{profile}", profile)
         prompt = prompt.replace("{permanent}", permanent_text)
+        prompt = append_identity_contract(prompt)
 
         page_count = len(day_pages)
         frag_count = len(unprocessed)
@@ -420,6 +423,7 @@ async def run_dream(trigger_type: str = "manual", model_override: str = None):
         lines = text.split("\n")
 
         action_buffer = ""  # 多行 JSON 缓冲：花括号未配平时跨行累积，配平后再解析
+        identity_violation_detected = False
 
         for line in lines:
             if _dream_cancelled:
@@ -445,25 +449,39 @@ async def run_dream(trigger_type: str = "manual", model_override: str = None):
                         try:
                             action = json.loads(match.group())
                             result = await _execute_dream_action(action, dream_id, stats)
+                            identity_violation_detected = identity_violation_detected or bool(result.get("identity_violation"))
                             yield {"type": "action", "data": result}
                         except Exception as e:
                             print(f"   ⚠️ Dream action 多行解析失败: {e}")
                     else:
-                        full_narrative += action_buffer + "\n"
-                        yield {"type": "narrative", "data": action_buffer}
+                        prepared_narrative, narrative_errors = prepare_generated_memory(action_buffer)
+                        if not narrative_errors:
+                            safe_text = prepared_narrative["content"]
+                            full_narrative += safe_text + "\n"
+                            yield {"type": "narrative", "data": safe_text}
+                        else:
+                            identity_violation_detected = True
                     action_buffer = ""
                 continue
 
             if line.startswith("narrative:"):
                 narrative_text = line[len("narrative:"):].strip()
-                full_narrative += narrative_text + "\n"
-                yield {"type": "narrative", "data": narrative_text}
+                prepared_narrative, narrative_errors = prepare_generated_memory(narrative_text)
+                if narrative_errors:
+                    identity_violation_detected = True
+                    print(f"   🚫 Dream 独白违反身份契约，未保存: {narrative_errors}")
+                    yield {"type": "action", "data": {"type": "narrative", "success": False, "errors": narrative_errors}}
+                else:
+                    narrative_text = prepared_narrative["content"]
+                    full_narrative += narrative_text + "\n"
+                    yield {"type": "narrative", "data": narrative_text}
 
             elif line.startswith("action:"):
                 action_text = line[len("action:"):].strip()
                 try:
                     action = json.loads(action_text)
                     result = await _execute_dream_action(action, dream_id, stats)
+                    identity_violation_detected = identity_violation_detected or bool(result.get("identity_violation"))
                     yield {"type": "action", "data": result}
                 except json.JSONDecodeError:
                     # 单行解析失败：花括号没配平 → 多行 JSON 开头，开始缓冲后续行
@@ -476,25 +494,45 @@ async def run_dream(trigger_type: str = "manual", model_override: str = None):
                             try:
                                 action = json.loads(match.group())
                                 result = await _execute_dream_action(action, dream_id, stats)
+                                identity_violation_detected = identity_violation_detected or bool(result.get("identity_violation"))
                                 yield {"type": "action", "data": result}
                             except Exception as e:
                                 print(f"   ⚠️ Dream action 解析失败: {e}")
                         else:
-                            full_narrative += action_text + "\n"
-                            yield {"type": "narrative", "data": action_text}
+                            prepared_narrative, narrative_errors = prepare_generated_memory(action_text)
+                            if not narrative_errors:
+                                safe_text = prepared_narrative["content"]
+                                full_narrative += safe_text + "\n"
+                                yield {"type": "narrative", "data": safe_text}
+                            else:
+                                identity_violation_detected = True
             else:
                 # 没有前缀的行，当作 narrative
-                full_narrative += line + "\n"
-                yield {"type": "narrative", "data": line}
+                prepared_narrative, narrative_errors = prepare_generated_memory(line)
+                if narrative_errors:
+                    identity_violation_detected = True
+                    print(f"   🚫 Dream 独白违反身份契约，未保存: {narrative_errors}")
+                else:
+                    line = prepared_narrative["content"]
+                    full_narrative += line + "\n"
+                    yield {"type": "narrative", "data": line}
 
         # 循环结束后若还有未配平的缓冲，当 narrative 处理，避免静默丢弃
         if action_buffer:
             print("   ⚠️ Dream action 缓冲未配平，当 narrative 处理")
-            full_narrative += action_buffer + "\n"
+            prepared_narrative, narrative_errors = prepare_generated_memory(action_buffer)
+            if not narrative_errors:
+                full_narrative += prepared_narrative["content"] + "\n"
+            else:
+                identity_violation_detected = True
             action_buffer = ""
 
-        # 6. 标记所有碎片已处理
-        await mark_memories_dreamed(processed_memory_ids)
+        # 6. 只有整轮身份叙述合法时才标记已处理。如果模型把我写成
+        # 观察者或按入口拆分，来源碎片必须留在待处理池中，下次可重试。
+        if identity_violation_detected:
+            print("   🚫 Dream 本轮存在身份契约违规，来源碎片保持未处理")
+        else:
+            await mark_memories_dreamed(processed_memory_ids)
 
         # 7. 完成
         now = datetime.now(TZ_CST)
@@ -561,17 +599,25 @@ async def _execute_dream_action(action: dict, dream_id: int, stats: dict) -> dic
                 result["reason"] = "merged_content 为空，拒绝软删除原始碎片"
             else:
                 title = action.get("merged_title", "")
-                from database import save_memory, get_embedding
-                embedding = await get_embedding(f"{title} {merged}" if title else merged)
-                embedding_json = json.dumps(embedding) if embedding else None
-                from database import get_pool
-                pool = await get_pool()
-                async with pool.acquire() as conn:
-                    new_merge_id = await conn.fetchval("""
-                        INSERT INTO memories (content, title, importance, memory_type, embedding, source, source_session, dream_processed_at)
-                        VALUES ($1, $2, 6, 'daily_digest', $3, 'dream_merge', 'dream', NOW())
-                        RETURNING id
-                    """, merged, title, embedding_json)
+                prepared, voice_errors = prepare_generated_memory(merged, title)
+                if voice_errors:
+                    result["success"] = False
+                    result["skipped"] = "identity contract violation"
+                    result["identity_violation"] = True
+                    result["errors"] = voice_errors
+                    return result
+                from database import save_memory
+                new_merge_id = await save_memory(
+                    content=prepared["content"],
+                    title=prepared["title"],
+                    importance=6,
+                    source="dream_merge",
+                    source_session="dream",
+                    memory_type="daily_digest",
+                    dream_processed_at=datetime.now(TZ_CST),
+                    memory_kind=prepared["memory_kind"],
+                    enforce_identity=True,
+                )
                 await soft_delete_memories(ids)
                 stats["memories_merged"] += len(ids)
                 result["merged"] = len(ids)
@@ -591,10 +637,17 @@ async def _execute_dream_action(action: dict, dream_id: int, stats: dict) -> dic
             target_resolution = action.get("target_resolution", 0.5)
             if mid is not None and softened_content:
                 mid = int(mid)
+                prepared, voice_errors = prepare_generated_memory(softened_content)
+                if voice_errors:
+                    result["success"] = False
+                    result["skipped"] = "identity contract violation"
+                    result["identity_violation"] = True
+                    result["errors"] = voice_errors
+                    return result
                 from database import soften_memory
                 success = await soften_memory(
                     memory_id=mid,
-                    softened_content=softened_content,
+                    softened_content=prepared["content"],
                     target_resolution=float(target_resolution),
                     extend_days=30,
                 )
@@ -607,11 +660,23 @@ async def _execute_dream_action(action: dict, dream_id: int, stats: dict) -> dic
                     result["skipped"] = "soften failed (locked, not found, or already softer)"
 
         elif action_type == "create_scene":
-            scene_id = await create_mem_scene(
+            prepared_scene, voice_errors = prepare_scene_fields(
                 title=action.get("title", "未命名场景"),
                 narrative=action.get("narrative", ""),
                 atomic_facts=action.get("atomic_facts", []),
                 foresight=action.get("foresight", []),
+            )
+            if voice_errors:
+                result["success"] = False
+                result["skipped"] = "identity contract violation"
+                result["identity_violation"] = True
+                result["errors"] = voice_errors
+                return result
+            scene_id = await create_mem_scene(
+                title=prepared_scene["title"],
+                narrative=prepared_scene["narrative"],
+                atomic_facts=prepared_scene["atomic_facts"],
+                foresight=prepared_scene["foresight"],
                 related_memory_ids=action.get("related_memory_ids", []),
                 dream_id=dream_id,
             )
@@ -632,7 +697,19 @@ async def _execute_dream_action(action: dict, dream_id: int, stats: dict) -> dic
                     if key in action:
                         updates[key] = action[key]
                 if updates:
-                    await update_mem_scene(sid, **updates)
+                    prepared_scene, voice_errors = prepare_scene_fields(
+                        narrative=updates.get("narrative") if "narrative" in updates else None,
+                        atomic_facts=updates.get("atomic_facts") if "atomic_facts" in updates else None,
+                        foresight=updates.get("foresight") if "foresight" in updates else None,
+                    )
+                    if voice_errors:
+                        result["success"] = False
+                        result["skipped"] = "identity contract violation"
+                        result["identity_violation"] = True
+                        result["errors"] = voice_errors
+                        return result
+                    clean_updates = {key: prepared_scene[key] for key in updates}
+                    await update_mem_scene(sid, **clean_updates)
                     stats["scenes_updated"] += 1
                     result["scene_id"] = sid
                     print(f"   📝 更新场景 #{sid}")

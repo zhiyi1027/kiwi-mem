@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from database import (
     init_tables, close_pool, get_pool, save_message, delete_latest_assistant_message, search_memories, save_memory,
     track_memory_recall, touch_permanent_memories, search_scenes,
-    get_all_memories_count, get_recent_memories, get_recent_conversation, delete_memory,
+    get_all_memories_count, get_recent_memories, get_recent_messages, get_latest_conversation_session_id, delete_memory,
     batch_delete_memories_guarded, clear_all_memories, update_memory, check_memory_duplicate,
     search_archived_memories, get_memory_versions,
     ingest_memory_event, get_memory_handoff,
@@ -55,6 +55,7 @@ from memory_identity import (
     MemoryClientConfigError,
     RECALL_IDENTITY_INSTRUCTION,
     authenticate_memory_client,
+    prepare_generated_memory,
     validate_autobiographical_memory,
 )
 from mcp_server import get_mcp_app, get_calendar_mcp_app, mcp_memory, mcp_calendar
@@ -1234,7 +1235,7 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
     - 不重置计数器，不干扰正常的定时提取节奏
     
     v3.7 改进：
-    - 提取时从数据库捞最近 N 轮完整对话（而不是只看最后一轮）
+    - 提取时只从当前 session 捞最近 N 轮完整对话（而不是混合所有窗口）
     - N = extract_interval，攒几轮就提取几轮
     
     v5.2 改进：
@@ -1304,16 +1305,16 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
         
         print(f"📋 对比范围：{len(existing_contents)} 条已有记忆（搜索相关 {len(related_contents)} + 最近 {len(recent_contents)}，去重后 {len(existing_contents)}）")
         
-        # ===== v3.7 改进：攒 N 轮完整对话一起提取 =====
-        # 从数据库捞最近 N*2 条消息（N轮 = N条user + N条assistant）
-        recent_msgs = await get_recent_conversation(limit=extract_interval * 2)
+        # 只读取当前 session。全局“最近 N 条”会在多窗口并行时把互不相干的
+        # 对话拼成一段从未发生过的经历。
+        recent_msgs = await get_recent_messages(session_id, limit=extract_interval * 2)
         
         if recent_msgs:
             messages_for_extraction = [
                 {"role": row["role"], "content": row["content"]}
                 for row in recent_msgs
             ]
-            print(f"📨 提取范围：最近 {len(messages_for_extraction)} 条消息（约 {len(messages_for_extraction)//2} 轮对话）")
+            print(f"📨 提取范围：当前会话最近 {len(messages_for_extraction)} 条消息（约 {len(messages_for_extraction)//2} 轮对话）")
         else:
             # 降级：如果数据库查不到，至少用当前这一轮
             messages_for_extraction = [
@@ -1401,6 +1402,8 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
                 source="ai_extracted",
                 emotional_weight=mem.get("emotional_weight", 0) or emotion_to_weight(emotion_level),
                 project_id=project_id,
+                memory_kind=mem.get("memory_kind"),
+                enforce_identity=True,
             )
             saved_count += 1
             saved_items.append({"title": mem.get("title", ""), "content": mem["content"][:120]})
@@ -1517,6 +1520,8 @@ async def memory_remember(request: Request):
         memory_space_id=context.memory_space_id,
         assistant_identity_id=context.assistant_identity_id,
         source_client=context.client_id,
+        memory_kind=memory_kind,
+        enforce_identity=True,
     )
     return {"memory_id": memory_id, "stored": True}
 
@@ -3688,7 +3693,7 @@ async def update_single_memory(memory_id: int, request: Request):
 async def add_memory_manual(request: Request):
     """
     手动添加记忆
-    请求体示例：{"content": "用户喜欢喝奶茶", "importance": 7}
+    请求体示例：{"content": "知知喜欢喝奶茶", "memory_kind": "user_fact", "importance": 7}
     """
     if not await get_memory_enabled():
         return {"error": "记忆系统未启用"}
@@ -3699,13 +3704,26 @@ async def add_memory_manual(request: Request):
         importance = body.get("importance", 5)
         title = body.get("title", "")
         category_id = body.get("category_id")
+        memory_kind = str(body.get("memory_kind") or "").strip().lower() or None
         
         if not content:
             return JSONResponse(status_code=400, content={"error": "content 不能为空"})
-        
-        new_id = await save_memory(content=content, importance=importance, source_session="manual", title=title, category_id=category_id, source="user_explicit")
+
+        prepared, voice_errors = prepare_generated_memory(content, title, memory_kind)
+        if voice_errors:
+            return JSONResponse(status_code=422, content={"error": "记忆违反第一人称身份契约", "details": voice_errors})
+        new_id = await save_memory(
+            content=prepared["content"],
+            importance=importance,
+            source_session="manual",
+            title=prepared["title"],
+            category_id=category_id,
+            source="user_explicit",
+            memory_kind=prepared["memory_kind"],
+            enforce_identity=True,
+        )
         total = await get_all_memories_count()
-        return {"status": "added", "id": new_id, "content": content, "importance": importance, "title": title, "total": total}
+        return {"status": "added", "id": new_id, "content": prepared["content"], "importance": importance, "title": prepared["title"], "total": total}
     except Exception as e:
         return {"error": str(e)}
 
@@ -3774,11 +3792,13 @@ async def api_extract_now(request: Request):
         try:
             body = await request.json()
             project_id = body.get("project_id")
+            session_id = str(body.get("session_id") or "").strip() or None
         except Exception:
-            pass
-        # 获取最近的对话消息
+            session_id = None
+        # 手动提取也只选择一个明确 session；未指定时选择最近活跃 session。
         extract_interval = await get_extract_interval()
-        recent_msgs = await get_recent_conversation(limit=extract_interval * 2)
+        session_id = session_id or await get_latest_conversation_session_id()
+        recent_msgs = await get_recent_messages(session_id, limit=extract_interval * 2) if session_id else []
         if not recent_msgs:
             return {"status": "ok", "action": "extract", "saved": 0, "skipped": 0, "message": "没有最近的对话可提取"}
         
@@ -3849,6 +3869,8 @@ async def api_extract_now(request: Request):
                 source="manual_extracted",
                 emotional_weight=mem.get("emotional_weight", 0),
                 project_id=project_id,
+                memory_kind=mem.get("memory_kind"),
+                enforce_identity=True,
             )
             saved_count += 1
         

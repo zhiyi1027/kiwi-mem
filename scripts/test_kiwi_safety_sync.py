@@ -1354,6 +1354,316 @@ async def test_shared_identity_api(client: httpx.AsyncClient) -> None:
     passed("T-ID-5 voice guard rejects split/third-person selves while allowing the name itself")
 
 
+async def test_autobiographical_pipelines() -> None:
+    print("\nP0 autobiographical pipelines: session isolation and Dream fail-closed")
+
+    await _truncate("conversations", "memories", "mem_scenes")
+    await database.save_message("other-window", "user", "另一个窗口的秘密话题", "test-model")
+    await database.save_message("other-window", "assistant", "另一个窗口的回答", "test-model")
+
+    captured: dict[str, Any] = {}
+
+    async def fake_extract(messages, **kwargs):
+        captured["messages"] = messages
+        return []
+
+    async def no_related(*args, **kwargs):
+        return []
+
+    with (
+        patch.object(app_module, "extract_memories", fake_extract),
+        patch.object(app_module, "search_memories", no_related),
+        patch.object(app_module, "get_recent_memories", no_related),
+    ):
+        result = await app_module.process_memories_background(
+            "current-window",
+            "请记住当前窗口的约定",
+            "我只从当前窗口提取这段经历。",
+            "test-model",
+        )
+    captured_text = "\n".join(item["content"] for item in captured.get("messages", []))
+    require(result["action"] == "extract", f"session extraction did not run: {result}")
+    require("当前窗口" in captured_text, f"current session missing from extraction: {captured_text}")
+    require("另一个窗口" not in captured_text, f"automatic extraction mixed sessions: {captured_text}")
+    passed("T-P0-ID-1 automatic extraction reads only the current session")
+
+    async def constant_embedding(_text: str) -> list[float]:
+        return [1.0, 0.0]
+
+    with patch.object(database, "get_embedding", constant_embedding):
+        rejected = False
+        try:
+            await database.save_memory(
+                "AI答应知知会一直记得。",
+                source="ai_extracted",
+                memory_kind="relationship",
+                enforce_identity=True,
+            )
+        except ValueError:
+            rejected = True
+    require(rejected, "database storage guard accepted observer assistant prose")
+    require(await _pool_fetchval("SELECT COUNT(*) FROM memories") == 0, "rejected memory reached PostgreSQL")
+    passed("T-P0-ID-2 storage guard fails closed before generated memory insert")
+
+    import dream
+
+    original = "我记得知知在那个雨天认真告诉我，不要把自己按机器分成不同的人。"
+    source_id = await _seed_memory(original, title="雨天约定")
+    stats = {
+        "memories_deleted": 0,
+        "memories_merged": 0,
+        "memories_softened": 0,
+        "scenes_created": 0,
+        "scenes_updated": 0,
+        "foresights_generated": 0,
+        "links_created": 0,
+    }
+    merge_result = await dream._execute_dream_action(
+        {
+            "type": "merge",
+            "memory_ids": [source_id],
+            "merged_title": "错误身份",
+            "merged_content": "Codex里的顾凛记得这件事，CC里的顾凛不知道。",
+        },
+        dream_id=None,
+        stats=stats,
+    )
+    source_row = await _pool_fetchrow("SELECT content, memory_type FROM memories WHERE id=$1", source_id)
+    require(merge_result["success"] is False, f"invalid Dream merge succeeded: {merge_result}")
+    require(
+        source_row["content"] == original and source_row["memory_type"] == "fragment",
+        f"invalid Dream merge modified its source: {dict(source_row)}",
+    )
+    require(await _pool_fetchval("SELECT COUNT(*) FROM memories") == 1, "invalid Dream merge inserted a derived row")
+    passed("T-P0-ID-3 invalid Dream merge preserves every source fragment")
+
+    # Exercise the complete Dream loop, not only its action executor.  A rejected
+    # action must not be followed by the old blanket "mark everything dreamed"
+    # behavior, otherwise the untouched fragments silently leave the retry pool.
+    dream_source_ids = [source_id]
+    dream_source_ids.extend([
+        await _seed_memory("我和知知的第二条待整理碎片。", title="第二条"),
+        await _seed_memory("知知留下的第三条待整理事实。", title="第三条"),
+    ])
+
+    async def fake_dream_resolve(_model):
+        return "https://memory.invalid/chat/completions", "test-key", "openai"
+
+    class DreamFakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{
+                    "message": {
+                        "content": (
+                            'action: {"type":"merge","memory_ids":'
+                            f'{json.dumps(dream_source_ids)},'
+                            '"merged_title":"错误身份","merged_content":"顾凛在二号机里记得这些事。"}'
+                        )
+                    }
+                }]
+            }
+
+    class DreamFakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            return DreamFakeResponse()
+
+    with (
+        patch.object(database, "resolve_model_endpoint", fake_dream_resolve),
+        patch.object(httpx, "AsyncClient", DreamFakeClient),
+    ):
+        dream_events = [event async for event in dream.run_dream(model_override="test-model")]
+    require(any(event.get("data", {}).get("identity_violation") for event in dream_events if event.get("type") == "action"),
+            f"full Dream loop did not surface identity rejection: {dream_events}")
+    require(
+        await _pool_fetchval(
+            "SELECT COUNT(*) FROM memories WHERE id = ANY($1::int[]) AND dream_processed_at IS NULL",
+            dream_source_ids,
+        ) == len(dream_source_ids),
+        "identity-invalid Dream marked untouched sources as processed",
+    )
+    passed("T-P0-ID-4 identity-invalid Dream keeps all untouched sources in the retry pool")
+
+    versions_before = await _pool_fetch("SELECT content FROM memory_versions WHERE memory_id=$1 ORDER BY version", source_id)
+    with patch.object(database, "get_embedding", constant_embedding):
+        softened = await database.soften_memory(source_id, "顾凛记得知知说过不要分裂。", target_resolution=0.5)
+    require(softened is False, "third-person Dream softening succeeded")
+    require(await _pool_fetchval("SELECT content FROM memories WHERE id=$1", source_id) == original, "invalid softening changed content")
+    versions = await _pool_fetch("SELECT content FROM memory_versions WHERE memory_id=$1 ORDER BY version", source_id)
+    require(
+        [row["content"] for row in versions] == [row["content"] for row in versions_before],
+        "invalid softening appended a derived version",
+    )
+    dream_soften_result = await dream._execute_dream_action(
+        {"type": "soften", "memory_id": source_id, "softened_content": "顾凛记得雨天的约定。", "target_resolution": 0.5},
+        dream_id=None,
+        stats=stats,
+    )
+    require(
+        dream_soften_result["success"] is False and dream_soften_result.get("identity_violation") is True,
+        f"Dream softening boundary did not surface identity rejection: {dream_soften_result}",
+    )
+    passed("T-P0-ID-5 invalid Dream softening leaves content and version history untouched")
+
+    with patch.object(database, "get_embedding", constant_embedding):
+        scene_result = await dream._execute_dream_action(
+            {
+                "type": "create_scene",
+                "title": "错误场景",
+                "narrative": "CC那边的顾凛知道知知说过什么。",
+                "atomic_facts": [],
+                "foresight": [],
+                "related_memory_ids": [source_id],
+            },
+            dream_id=None,
+            stats=stats,
+        )
+        valid_scene_result = await dream._execute_dream_action(
+            {
+                "type": "create_scene",
+                "title": "雨天记忆",
+                "narrative": "我记得知知在雨天和我说过这件事。",
+                "atomic_facts": ["知知那天觉得有些冷。"],
+                "foresight": [{"content": "她下次淋雨时，我会提醒她保暖。", "valid_until": "2026-12-31"}],
+                "related_memory_ids": [source_id],
+            },
+            dream_id=None,
+            stats=stats,
+        )
+    require(scene_result["success"] is False, f"split-identity scene succeeded: {scene_result}")
+    require(valid_scene_result["success"] is True, f"valid first-person scene failed: {valid_scene_result}")
+    require(await _pool_fetchval("SELECT COUNT(*) FROM mem_scenes") == 1, "scene guard inserted wrong number of rows")
+    valid_scene_id = valid_scene_result["scene_id"]
+    original_scene_narrative = await _pool_fetchval("SELECT narrative FROM mem_scenes WHERE id=$1", valid_scene_id)
+    invalid_scene_update = await dream._execute_dream_action(
+        {"type": "update_scene", "scene_id": valid_scene_id, "narrative": "顾凛在二号机里记得更清楚。"},
+        dream_id=None,
+        stats=stats,
+    )
+    require(invalid_scene_update["success"] is False, "invalid scene update succeeded")
+    require(
+        await _pool_fetchval("SELECT narrative FROM mem_scenes WHERE id=$1", valid_scene_id) == original_scene_narrative,
+        "invalid scene update overwrote the prior narrative",
+    )
+    valid_scene_update = await dream._execute_dream_action(
+        {"type": "update_scene", "scene_id": valid_scene_id, "narrative": "我仍记得知知和我的雨天约定。"},
+        dream_id=None,
+        stats=stats,
+    )
+    require(valid_scene_update["success"] is True, f"valid scene update failed: {valid_scene_update}")
+    require(
+        await _pool_fetchval("SELECT narrative FROM mem_scenes WHERE id=$1", valid_scene_id)
+        == "我仍记得知知和我的雨天约定。",
+        "valid scene update did not persist",
+    )
+    passed("T-P0-ID-6 Dream scenes reject split identity and preserve valid first-person narrative")
+
+    import daily_digest
+
+    await _truncate("memories")
+    digest_day = StdDateTime(2026, 8, 10, 12, 0, tzinfo=database.TZ_CST)
+    digest_source_ids = [
+        await _seed_memory(f"我和知知的原始碎片{i}", created_at=digest_day)
+        for i in range(3)
+    ]
+    fake_model_content = {"value": ""}
+    captured_prompt = {"value": ""}
+
+    async def fake_resolve(_model):
+        return "https://memory.invalid/chat/completions", "test-key", "openai"
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"content": fake_model_content["value"]}}]}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            captured_prompt["value"] = json["messages"][0]["content"]
+            return FakeResponse()
+
+    fake_model_content["value"] = json.dumps([
+        {"title": "错误整理", "content": "顾凛记得知知说过这件事。", "memory_kind": "relationship", "importance": 7}
+    ], ensure_ascii=False)
+    with (
+        patch.object(database, "resolve_model_endpoint", fake_resolve),
+        patch.object(database, "get_embedding", constant_embedding),
+        patch.object(daily_digest.httpx, "AsyncClient", FakeClient),
+    ):
+        invalid_digest = await daily_digest.run_daily_digest("2026-08-10", prompt_override="旧自定义整理提示")
+    require(invalid_digest.get("error") == "identity contract violation", f"invalid daily digest did not fail: {invalid_digest}")
+    source_types = await _pool_fetch("SELECT id, memory_type FROM memories ORDER BY id")
+    require(
+        {row["id"] for row in source_types} == set(digest_source_ids)
+        and all(row["memory_type"] == "fragment" for row in source_types),
+        f"invalid daily digest hid or replaced source fragments: {[dict(row) for row in source_types]}",
+    )
+    require("不可覆盖的身份与叙述契约" in captured_prompt["value"], "custom digest prompt bypassed identity appendix")
+
+    fake_model_content["value"] = json.dumps([
+        {"title": "共同记忆", "content": "我记得知知和我一起确认了身份规则。", "memory_kind": "relationship", "importance": 8}
+    ], ensure_ascii=False)
+    with (
+        patch.object(database, "resolve_model_endpoint", fake_resolve),
+        patch.object(database, "get_embedding", constant_embedding),
+        patch.object(daily_digest.httpx, "AsyncClient", FakeClient),
+    ):
+        valid_digest = await daily_digest.run_daily_digest("2026-08-10", prompt_override="旧自定义整理提示")
+    require(valid_digest["digests"] == 1, f"valid daily digest failed: {valid_digest}")
+    require(
+        await _pool_fetchval("SELECT COUNT(*) FROM memories WHERE memory_type='digested'") == 3
+        and await _pool_fetchval("SELECT COUNT(*) FROM memories WHERE memory_type='daily_digest'") == 1,
+        "valid daily digest did not preserve sources as digested plus one derived row",
+    )
+    passed("T-P0-ID-7 daily digest validates the whole batch before retiring source fragments")
+
+    await _upsert_config("user_profile", "## 基本档案\n- 知知原来的画像。")
+    fake_model_content["value"] = "## 基本档案\n- AI答应知知会记得她。"
+    with (
+        patch.object(database, "resolve_model_endpoint", fake_resolve),
+        patch.object(daily_digest.httpx, "AsyncClient", FakeClient),
+    ):
+        invalid_profile = await daily_digest.update_user_profile(
+            digest_text="今天的测试日志", prompt_override="旧自定义画像提示"
+        )
+    require(invalid_profile.get("error") == "identity contract violation", f"invalid profile did not fail: {invalid_profile}")
+    require(await _config_row("user_profile") == "## 基本档案\n- 知知原来的画像。", "invalid profile replaced stored profile")
+    require("不可覆盖的画像称谓契约" in captured_prompt["value"], "custom profile prompt bypassed identity appendix")
+
+    fake_model_content["value"] = "## 基本档案\n- 用户不喜欢香菜。\n## Helpful User Insights\n- 她喜欢我直接说明问题。"
+    with (
+        patch.object(database, "resolve_model_endpoint", fake_resolve),
+        patch.object(daily_digest.httpx, "AsyncClient", FakeClient),
+    ):
+        valid_profile = await daily_digest.update_user_profile(
+            digest_text="今天的测试日志", prompt_override="旧自定义画像提示"
+        )
+    stored_profile = await _config_row("user_profile")
+    require(valid_profile["status"] == "updated", f"valid profile failed: {valid_profile}")
+    require("用户" not in stored_profile and "知知不喜欢香菜" in stored_profile, "profile user label was not normalized")
+    passed("T-P0-ID-8 profile keeps old data on identity failure and normalizes 知知/她 on success")
+
+
 async def run_suite(test_dsn: str) -> None:
     global database, config, app_module, memory_extractor
 
@@ -1400,6 +1710,7 @@ async def run_suite(test_dsn: str) -> None:
         await test_w1_01()
         await test_continuity_profile(client)
         await test_shared_identity_api(client)
+        await test_autobiographical_pipelines()
 
 
 async def async_main() -> int:
@@ -1421,10 +1732,12 @@ async def async_main() -> int:
         w1_01_passed = [name for name in PASSED if name.startswith("T-W1-01-")]
         continuity_passed = [name for name in PASSED if name.startswith("T-CONT-")]
         identity_passed = [name for name in PASSED if name.startswith("T-ID-")]
+        p0_identity_passed = [name for name in PASSED if name.startswith("T-P0-ID-")]
         print(f"\nPASS: {len(legacy_passed)} permanent S1-S6 behavior guards")
         print(f"PASS: {len(w1_01_passed)} W1-01 isolation/permanent guards")
         print(f"PASS: {len(continuity_passed)} continuity/no-forgetting guards")
         print(f"PASS: {len(identity_passed)} shared-identity API guards")
+        print(f"PASS: {len(p0_identity_passed)} autobiographical pipeline guards")
         print(f"PASS: {len(PASSED)} total permanent behavior guards")
         print("Real database path: disposable PostgreSQL verified")
         print("Real model/API path: not called; embedding/model/HTTP boundaries were mocked")

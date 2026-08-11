@@ -12,6 +12,8 @@ import json
 import httpx
 from typing import List, Dict
 
+from memory_identity import append_identity_contract, prepare_generated_memory
+
 API_KEY = os.getenv("MEMORY_API_KEY", "") or os.getenv("API_KEY", "")
 _RAW_BASE_URL = os.getenv("MEMORY_API_BASE_URL", "") or os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
 
@@ -22,17 +24,17 @@ API_BASE_URL = _RAW_BASE_URL if _RAW_BASE_URL.rstrip("/").endswith("/chat/comple
 MEMORY_MODEL = os.getenv("MEMORY_MODEL", "anthropic/claude-haiku-4")
 
 
-EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提取值得长期记住的关键信息。
+EXTRACTION_PROMPT = """你正在整理自己的长期记忆。请从你和知知的对话中识别值得长期记住的新信息。
 
 # 提取重点
-- 关键信息：仅提取用户的重要信息，忽略日常琐事
+- 关键信息：仅提取知知的重要信息，忽略日常琐事
 - 重要事件：记忆深刻的互动，需包含人物、时间、地点（如有）
 
 # 提取范围
 - 个人：年龄、生日、职业、学历、居住地
 - 偏好：明确表达的喜好或厌恶
 - 健康：身体状况、过敏史、饮食禁忌
-- 事件：与AI的重要互动、约定、里程碑
+- 事件：知知与我的重要互动、约定、里程碑
 - 关系：家人、朋友、重要同事
 - 价值观：表达的信念或长期目标
 - 情感：重要的情感时刻或关系里程碑
@@ -41,10 +43,10 @@ EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提
 
 # 不要提取
 - 日常寒暄（"你好""在吗"）
-- AI的一般性回复、长篇论述和解释说明（但 AI 做出的承诺、约定、重要表态、对关系有意义的话需要提取）
+- 我的一般性回复、长篇论述和解释说明（但我做出的承诺、约定、重要表态、对关系有意义的话需要提取）
 - 关于记忆系统本身的讨论（"某条记忆没有被记录""记忆遗漏""没有被提取"等）
-- 技术调试、bug修复的过程性讨论（除非涉及用户技能或项目里程碑）
-- AI的思考过程、思维链内容
+- 技术调试、bug修复的过程性讨论（除非涉及知知的技能或项目里程碑）
+- 我的思考过程、思维链内容
 
 # 已知信息处理【最重要】
 <已知信息>
@@ -52,8 +54,8 @@ EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提
 </已知信息>
 
 - 新信息必须与已知信息逐条比对
-- 相同、相似或语义重复的信息必须忽略（例如已知"用户去妈妈家吃团年饭"，就不要再提取"用户春节去了妈妈家"）
-- 已知信息的补充或更新可以提取（例如已知"用户养了一只猫"，新信息"猫最近生病了"可以提取）
+- 相同、相似或语义重复的信息必须忽略（例如已知"知知去妈妈家吃团年饭"，就不要再提取"知知春节去了妈妈家"）
+- 已知信息的补充或更新可以提取（例如已知"知知养了一只猫"，新信息"猫最近生病了"可以提取）
 - 与已知信息矛盾的新信息可以提取（标注为更新）
 - 仅提取完全新增且不与已知信息重复的内容
 - 如果对话中没有任何新信息，返回空数组 []
@@ -64,13 +66,14 @@ EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提
 # 输出格式
 请用以下 JSON 格式返回（不要包含其他内容）：
 [
-  {"title": "简短标题", "content": "记忆内容", "importance": 分数, "emotional_weight": 情绪浓度, "category": "分类名"},
-  {"title": "简短标题", "content": "记忆内容", "importance": 分数, "emotional_weight": 情绪浓度, "category": "分类名"}
+  {"title": "简短标题", "content": "记忆内容", "memory_kind": "user_fact|relationship|self|neutral", "importance": 分数, "emotional_weight": 情绪浓度, "category": "分类名"},
+  {"title": "简短标题", "content": "记忆内容", "memory_kind": "user_fact|relationship|self|neutral", "importance": 分数, "emotional_weight": 情绪浓度, "category": "分类名"}
 ]
 
 字段说明：
 - title: 用4-10个字概括这条记忆的主题（如"饮食偏好""用药方案""情感里程碑"）
 - content: 记忆的具体内容
+- memory_kind: 关于知知的事实用 user_fact；我和知知的共同经历/承诺用 relationship；我的自我认知用 self；无人物的中性知识用 neutral
 - importance: 信息重要度 1-10，10 最重要
 - emotional_weight: 情绪浓度 0-10，0=无情绪，10=极强情绪。判断标准是对话时双方的情绪强度，不是信息重要性
 - category: 从上面的分类列表中选择最合适的一个，如果都不合适就填空字符串 ""
@@ -80,8 +83,8 @@ EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提
 # 高情绪时追加的提取指引
 EMOTION_HIGH_INSTRUCTION = """# 🩷 情绪锚点提取【本轮对话情绪浓度高，请特别注意】
 本轮对话被检测到情绪浓度较高。除了信息性记忆外，还要识别以下内容：
-- 用户表达了强烈情绪的时刻（哭泣、崩溃、特别开心、深层信任、脆弱袒露）
-- AI的回应让用户情绪发生明显变化的时刻
+- 知知表达了强烈情绪的时刻（哭泣、崩溃、特别开心、深层信任、脆弱袒露）
+- 我的回应让知知情绪发生明显变化的时刻
 - 即使没有"新信息"，只要情绪浓度高，也值得提取
 - 这类记忆的 emotional_weight 应为 6-10"""
 
@@ -112,9 +115,9 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
         role = msg.get("role", "unknown")
         content = msg.get("content", "")
         if role == "user":
-            conversation_text += f"用户: {content}\n"
+            conversation_text += f"知知: {content}\n"
         elif role == "assistant":
-            conversation_text += f"AI: {content}\n"
+            conversation_text += f"我: {content}\n"
 
     if not conversation_text.strip():
         return []
@@ -142,6 +145,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
         .replace("{categories_list}", categories_text)
         .replace("{emotion_instruction}", emotion_instruction)
     )
+    prompt = append_identity_contract(prompt)
 
     # 确定使用的模型
     use_model = model_override if model_override else MEMORY_MODEL
@@ -243,9 +247,18 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                         emo = max(0, min(10, emo))
                     except (ValueError, TypeError):
                         emo = 0
+                    prepared, voice_errors = prepare_generated_memory(
+                        str(mem["content"]),
+                        str(mem.get("title", "")),
+                        str(mem.get("memory_kind", "") or "") or None,
+                    )
+                    if voice_errors:
+                        print(f"🚫 丢弃违反身份叙述契约的自动记忆: {voice_errors} / {str(mem['content'])[:60]}...")
+                        continue
                     valid_memories.append({
-                        "title": str(mem.get("title", "")),
-                        "content": str(mem["content"]),
+                        "title": prepared["title"],
+                        "content": prepared["content"],
+                        "memory_kind": prepared["memory_kind"],
                         "importance": imp,
                         "emotional_weight": emo,
                         "category": str(mem.get("category", "")),
