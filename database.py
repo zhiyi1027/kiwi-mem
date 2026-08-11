@@ -31,6 +31,8 @@ import jieba
 import jieba.analyse
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+CANONICAL_ASSISTANT_ID = os.getenv("MEMORY_ASSISTANT_ID", "grey_knox").strip() or "grey_knox"
+CANONICAL_MEMORY_SPACE_ID = os.getenv("MEMORY_SPACE_ID", "zhizhi_grey").strip() or "zhizhi_grey"
 
 # ============================================================
 # Embedding 配置
@@ -641,6 +643,9 @@ async def init_tables():
         for col_name, col_def in [
             ("archived_at", "TIMESTAMPTZ DEFAULT NULL"),
             ("archive_reason", "TEXT DEFAULT NULL"),
+            ("memory_space_id", "TEXT NOT NULL DEFAULT 'zhizhi_grey'"),
+            ("assistant_identity_id", "TEXT NOT NULL DEFAULT 'grey_knox'"),
+            ("source_client", "TEXT DEFAULT NULL"),
         ]:
             has_col = await conn.fetchval("""
                 SELECT EXISTS (
@@ -680,6 +685,32 @@ async def init_tables():
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_memory_versions_memory
             ON memory_versions (memory_id, version DESC)
+        """)
+
+        # Append-only evidence received from Codex, both CC rooms, or a future
+        # API frontend.  Credentials identify source_client only; identity and
+        # memory space are always assigned by the server.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_events (
+                event_id                TEXT PRIMARY KEY,
+                memory_space_id          TEXT NOT NULL DEFAULT 'zhizhi_grey',
+                assistant_identity_id    TEXT NOT NULL DEFAULT 'grey_knox',
+                source_client            TEXT NOT NULL,
+                conversation_id          TEXT NOT NULL,
+                role                     TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+                content                  TEXT NOT NULL,
+                occurred_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                metadata                 JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memory_events_space_conversation
+            ON memory_events (memory_space_id, conversation_id, occurred_at, event_id)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memory_events_space_recent
+            ON memory_events (memory_space_id, occurred_at DESC)
         """)
 
         # v6.2：providers 表添加 api_format 列（openai / anthropic）
@@ -1106,7 +1137,19 @@ async def get_handoff_data(source_conversation_id: str, tail_count: int = 6):
 # 记忆操作
 # ============================================================
 
-async def save_memory(content: str, importance: int = 5, source_session: str = "", title: str = "", category_id: int = None, source: str = "ai_extracted", emotional_weight: int = 0, project_id: str = None) -> int:
+async def save_memory(
+    content: str,
+    importance: int = 5,
+    source_session: str = "",
+    title: str = "",
+    category_id: int = None,
+    source: str = "ai_extracted",
+    emotional_weight: int = 0,
+    project_id: str = None,
+    memory_space_id: str = CANONICAL_MEMORY_SPACE_ID,
+    assistant_identity_id: str = CANONICAL_ASSISTANT_ID,
+    source_client: str = None,
+) -> int:
     """
     存储新记忆，自动生成 embedding 向量
     如果 embedding 生成失败，记忆仍会存储（只是没有向量，降级为关键词搜索）
@@ -1130,10 +1173,17 @@ async def save_memory(content: str, importance: int = 5, source_session: str = "
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            new_id = await conn.fetchval(
-                "INSERT INTO memories (content, importance, source_session, embedding, title, category_id, source, emotional_weight, project_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
-                content, importance, source_session, embedding_json, title, category_id, source, emotional_weight, project_id,
-            )
+            new_id = await conn.fetchval("""
+                INSERT INTO memories (
+                    content, importance, source_session, embedding, title,
+                    category_id, source, emotional_weight, project_id,
+                    memory_space_id, assistant_identity_id, source_client
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                RETURNING id
+            """, content, importance, source_session, embedding_json, title,
+                 category_id, source, emotional_weight, project_id,
+                 memory_space_id, assistant_identity_id, source_client)
             await conn.execute("""
                 INSERT INTO memory_versions
                     (memory_id, version, content, title, resolution, embedding, change_type)
@@ -1151,6 +1201,81 @@ async def save_memory(content: str, importance: int = 5, source_session: str = "
     )
     
     return new_id
+
+
+async def ingest_memory_event(
+    *,
+    event_id: str,
+    source_client: str,
+    conversation_id: str,
+    role: str,
+    content: str,
+    occurred_at: datetime,
+    metadata: dict | None = None,
+    memory_space_id: str = CANONICAL_MEMORY_SPACE_ID,
+    assistant_identity_id: str = CANONICAL_ASSISTANT_ID,
+) -> dict:
+    """Append one raw event, idempotently, without modifying prior evidence."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO memory_events (
+                event_id, memory_space_id, assistant_identity_id, source_client,
+                conversation_id, role, content, occurred_at, metadata
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+            ON CONFLICT (event_id) DO NOTHING
+            RETURNING event_id, created_at
+        """, event_id, memory_space_id, assistant_identity_id, source_client,
+             conversation_id, role, content, occurred_at,
+             json.dumps(metadata or {}, ensure_ascii=False))
+        if row:
+            return {"created": True, "event_id": row["event_id"], "created_at": row["created_at"]}
+        existing = await conn.fetchrow("""
+            SELECT event_id, memory_space_id, assistant_identity_id,
+                   source_client, conversation_id, role, content, occurred_at, created_at
+            FROM memory_events WHERE event_id = $1
+        """, event_id)
+        return {"created": False, **dict(existing)} if existing else {"created": False, "event_id": event_id}
+
+
+async def get_memory_handoff(
+    *,
+    current_conversation_id: str | None = None,
+    tail_count: int = 6,
+    memory_space_id: str = CANONICAL_MEMORY_SPACE_ID,
+) -> dict | None:
+    """Return the latest prior conversation tail from the shared event log."""
+    safe_tail = max(1, min(int(tail_count or 6), 50))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        source = await conn.fetchrow("""
+            SELECT conversation_id, MAX(occurred_at) AS last_event_at
+            FROM memory_events
+            WHERE memory_space_id = $1
+              AND role IN ('user', 'assistant')
+              AND ($2::text IS NULL OR conversation_id <> $2)
+            GROUP BY conversation_id
+            ORDER BY last_event_at DESC
+            LIMIT 1
+        """, memory_space_id, current_conversation_id)
+        if not source:
+            return None
+        rows = await conn.fetch("""
+            SELECT event_id, conversation_id, role, content, occurred_at
+            FROM memory_events
+            WHERE memory_space_id = $1
+              AND conversation_id = $2
+              AND role IN ('user', 'assistant')
+            ORDER BY occurred_at DESC, event_id DESC
+            LIMIT $3
+        """, memory_space_id, source["conversation_id"], safe_tail)
+    messages = [dict(row) for row in reversed(rows)]
+    return {
+        "conversation_id": source["conversation_id"],
+        "last_event_at": source["last_event_at"],
+        "tail_messages": messages,
+    }
 
 
 async def delete_memory(memory_id: int, force: bool = False) -> str:
@@ -1225,7 +1350,11 @@ async def clear_all_memories() -> int:
         )
 
 
-async def search_archived_memories(query: str = "", limit: int = 20) -> list:
+async def search_archived_memories(
+    query: str = "",
+    limit: int = 20,
+    memory_space_id: str = CANONICAL_MEMORY_SPACE_ID,
+) -> list:
     """Search memories that have left normal recall, including old versions.
 
     This path is intentionally explicit and does not heat or reactivate rows.
@@ -1266,6 +1395,7 @@ async def search_archived_memories(query: str = "", limit: int = 20) -> list:
                     OR (m.valid_until IS NOT NULL AND m.valid_until <= NOW())
                     OR m.memory_type = 'dream_deleted'
                   )
+              AND m.memory_space_id = $2
               AND (
                     $1 = '%%'
                     OR m.title ILIKE $1
@@ -1276,8 +1406,8 @@ async def search_archived_memories(query: str = "", limit: int = 20) -> list:
                     )
                   )
             ORDER BY COALESCE(m.archived_at, m.valid_until, m.created_at) DESC
-            LIMIT $2
-        """, pattern, limit)
+            LIMIT $3
+        """, pattern, memory_space_id, limit)
     return [dict(row) for row in rows]
 
 
@@ -1471,7 +1601,14 @@ async def touch_permanent_memories(memory_ids: list):
         return 0
 
 
-async def search_memories(query: str, limit: int = 10, track_recall: bool = True, project_id: str = None, return_embedding: bool = False):
+async def search_memories(
+    query: str,
+    limit: int = 10,
+    track_recall: bool = True,
+    project_id: str = None,
+    return_embedding: bool = False,
+    memory_space_id: str = CANONICAL_MEMORY_SPACE_ID,
+):
     """
     搜索相关记忆 —— RRF 混合检索（v5.7）
 
@@ -1504,11 +1641,20 @@ async def search_memories(query: str, limit: int = 10, track_recall: bool = True
     if query_embedding is None:
         # embedding 失败，只用关键词搜索
         print("⚠️  向量搜索不可用 → 仅关键词搜索")
-        results = await _keyword_search(query, limit, heat_params, project_id=project_id)
+        results = await _keyword_search(
+            query, limit, heat_params,
+            project_id=project_id, memory_space_id=memory_space_id,
+        )
     else:
         # 第二步：并行执行两路搜索
-        vec_task = _vector_search(query_embedding, expanded_limit, heat_params, project_id=project_id)
-        kw_task = _keyword_search(query, expanded_limit, heat_params, project_id=project_id)
+        vec_task = _vector_search(
+            query_embedding, expanded_limit, heat_params,
+            project_id=project_id, memory_space_id=memory_space_id,
+        )
+        kw_task = _keyword_search(
+            query, expanded_limit, heat_params,
+            project_id=project_id, memory_space_id=memory_space_id,
+        )
         vec_results, kw_results = await asyncio.gather(vec_task, kw_task)
         
         # 第三步：RRF 合并
@@ -1548,7 +1694,13 @@ async def search_memories(query: str, limit: int = 10, track_recall: bool = True
     return results
 
 
-async def _vector_search(query_embedding: list, limit: int, heat_params: dict, project_id: str = None) -> list:
+async def _vector_search(
+    query_embedding: list,
+    limit: int,
+    heat_params: dict,
+    project_id: str = None,
+    memory_space_id: str = CANONICAL_MEMORY_SPACE_ID,
+) -> list:
     """
     纯向量语义搜索 —— 不做召回追踪，仅返回评分结果。
     project_id: 提供时搜全局(NULL)+该项目；不提供时只搜全局(NULL)
@@ -1573,8 +1725,9 @@ async def _vector_search(query_embedding: list, limit: int, heat_params: dict, p
                    FROM memories m LEFT JOIN memory_categories c ON m.category_id = c.id
                    WHERE COALESCE(m.memory_type, 'fragment') NOT IN ('digested', 'dream_deleted')
                      AND (m.valid_until IS NULL OR m.valid_until > NOW())
+                     AND m.memory_space_id = $2
                      {project_filter}""",
-                project_id,
+                project_id, memory_space_id,
             )
         else:
             rows = await conn.fetch(
@@ -1591,7 +1744,9 @@ async def _vector_search(query_embedding: list, limit: int, heat_params: dict, p
                    FROM memories m LEFT JOIN memory_categories c ON m.category_id = c.id
                    WHERE COALESCE(m.memory_type, 'fragment') NOT IN ('digested', 'dream_deleted')
                      AND (m.valid_until IS NULL OR m.valid_until > NOW())
-                     AND m.project_id IS NULL"""
+                     AND m.project_id IS NULL
+                     AND m.memory_space_id = $1""",
+                memory_space_id,
             )
     
     if not rows:
@@ -1997,7 +2152,13 @@ def extract_search_keywords(query: str) -> List[str]:
     return list(keywords)
 
 
-async def _keyword_search(query: str, limit: int = 10, heat_params: dict = None, project_id: str = None):
+async def _keyword_search(
+    query: str,
+    limit: int = 10,
+    heat_params: dict = None,
+    project_id: str = None,
+    memory_space_id: str = CANONICAL_MEMORY_SPACE_ID,
+):
     """
     关键词搜索（v5.7：升级为 RRF 混合检索的一路）
     
@@ -2040,10 +2201,12 @@ async def _keyword_search(query: str, limit: int = 10, heat_params: dict = None,
             proj_idx = len(keywords) + 1
             project_clause = f"AND (m.project_id IS NULL OR m.project_id = ${proj_idx})"
             params.append(project_id)
-            limit_idx = proj_idx + 1
+            space_idx = proj_idx + 1
         else:
             project_clause = "AND m.project_id IS NULL"
-            limit_idx = len(keywords) + 1
+            space_idx = len(keywords) + 1
+        params.append(memory_space_id)
+        limit_idx = space_idx + 1
         params.append(limit)
         
         sql = f"""
@@ -2068,6 +2231,7 @@ async def _keyword_search(query: str, limit: int = 10, heat_params: dict = None,
             WHERE ({where_clause})
               AND COALESCE(m.memory_type, 'fragment') NOT IN ('digested', 'dream_deleted')
               AND (m.valid_until IS NULL OR m.valid_until > NOW())
+              AND m.memory_space_id = ${space_idx}
               {project_clause}
             ORDER BY score DESC, m.importance DESC, m.created_at DESC
             LIMIT ${limit_idx}

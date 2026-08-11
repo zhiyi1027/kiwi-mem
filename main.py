@@ -21,7 +21,7 @@ import copy
 import math
 import httpx
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, UploadFile, File
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -31,6 +31,7 @@ from database import (
     get_all_memories_count, get_recent_memories, get_recent_conversation, delete_memory,
     batch_delete_memories_guarded, clear_all_memories, update_memory, check_memory_duplicate,
     search_archived_memories, get_memory_versions,
+    ingest_memory_event, get_memory_handoff,
     migrate_embeddings, backfill_permanent_memory_embeddings, get_embedding_stats,
     # v5.3 时间有效期 + 矛盾检测
     invalidate_memory, create_memory_edge, detect_contradictions,
@@ -50,6 +51,12 @@ from config import (
     get_all_config, set_config, get_config, get_config_int, get_config_bool, get_config_float,
 )
 from memory_extractor import extract_memories
+from memory_identity import (
+    MemoryClientConfigError,
+    RECALL_IDENTITY_INSTRUCTION,
+    authenticate_memory_client,
+    validate_autobiographical_memory,
+)
 from mcp_server import get_mcp_app, get_calendar_mcp_app, mcp_memory, mcp_calendar
 from web_search import web_search, format_results_for_prompt, get_engine_list
 from mcp_client import get_tools_for_servers, call_tool, call_tools_batch, clear_tool_cache
@@ -304,6 +311,63 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _memory_client_context(request: Request):
+    """Authenticate a door while keeping identity assignment server-owned."""
+    authorization = request.headers.get("authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(
+            status_code=401,
+            detail="memory client bearer token required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        context = authenticate_memory_client(token.strip())
+    except MemoryClientConfigError:
+        raise HTTPException(status_code=503, detail="memory client authentication is not configured")
+    if context is None:
+        raise HTTPException(
+            status_code=401,
+            detail="invalid memory client bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return context
+
+
+def _reject_memory_identity_override(payload: dict) -> None:
+    reserved = {"assistant_identity_id", "memory_space_id", "source_client"}
+    attempted = sorted(reserved.intersection(payload))
+    if attempted:
+        raise HTTPException(
+            status_code=422,
+            detail=f"identity fields are assigned by the server: {', '.join(attempted)}",
+        )
+
+
+def _required_memory_text(payload: dict, field: str, max_length: int) -> str:
+    value = str(payload.get(field) or "").strip()
+    if not value:
+        raise HTTPException(status_code=422, detail=f"{field} must not be empty")
+    if len(value) > max_length:
+        raise HTTPException(status_code=422, detail=f"{field} exceeds {max_length} characters")
+    return value
+
+
+def _parse_memory_event_time(value):
+    if value in (None, ""):
+        return datetime.now(timezone.utc)
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=422, detail="occurred_at must be an ISO-8601 timestamp")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 # ============================================================
 # 模板变量替换
@@ -1369,6 +1433,170 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
 # ============================================================
 # API 接口
 # ============================================================
+
+@app.get("/memory/v1/whoami")
+async def memory_whoami(request: Request):
+    """Show which door authenticated and the one identity it belongs to."""
+    context = _memory_client_context(request)
+    return {
+        "client_id": context.client_id,
+        "assistant_identity_id": context.assistant_identity_id,
+        "memory_space_id": context.memory_space_id,
+    }
+
+
+@app.post("/memory/v1/events/ingest")
+async def memory_ingest_event(request: Request):
+    """Append raw dialogue evidence; retries are idempotent by event_id."""
+    context = _memory_client_context(request)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="request body must be a JSON object")
+    _reject_memory_identity_override(payload)
+
+    event_id = _required_memory_text(payload, "event_id", 200)
+    conversation_id = _required_memory_text(payload, "conversation_id", 200)
+    content = _required_memory_text(payload, "content", 200000)
+    role = str(payload.get("role") or "").strip().lower()
+    if role not in {"user", "assistant", "system"}:
+        raise HTTPException(status_code=422, detail="role must be user, assistant, or system")
+    metadata = payload.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise HTTPException(status_code=422, detail="metadata must be a JSON object")
+
+    result = await ingest_memory_event(
+        event_id=event_id,
+        source_client=context.client_id,
+        conversation_id=conversation_id,
+        role=role,
+        content=content,
+        occurred_at=_parse_memory_event_time(payload.get("occurred_at")),
+        metadata=metadata,
+        memory_space_id=context.memory_space_id,
+        assistant_identity_id=context.assistant_identity_id,
+    )
+    # Source metadata stays available for audit in PostgreSQL, never in recalled prose.
+    return {"created": bool(result.get("created")), "event_id": result.get("event_id", event_id)}
+
+
+@app.post("/memory/v1/memories/remember")
+async def memory_remember(request: Request):
+    """Store an explicit semantic memory in the assistant's own voice."""
+    context = _memory_client_context(request)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="request body must be a JSON object")
+    _reject_memory_identity_override(payload)
+
+    content = _required_memory_text(payload, "content", 50000)
+    title = str(payload.get("title") or "").strip()
+    if len(title) > 500:
+        raise HTTPException(status_code=422, detail="title exceeds 500 characters")
+    memory_kind = str(payload.get("memory_kind") or "relationship").strip().lower()
+    voice_errors = validate_autobiographical_memory(content, title, memory_kind)
+    if voice_errors:
+        raise HTTPException(status_code=422, detail=voice_errors)
+    try:
+        importance = int(payload.get("importance", 5))
+        emotional_weight = int(payload.get("emotional_weight", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="importance and emotional_weight must be integers")
+    if not 1 <= importance <= 10 or not 0 <= emotional_weight <= 10:
+        raise HTTPException(status_code=422, detail="importance must be 1-10 and emotional_weight must be 0-10")
+    conversation_id = str(payload.get("conversation_id") or "").strip()
+    if len(conversation_id) > 200:
+        raise HTTPException(status_code=422, detail="conversation_id exceeds 200 characters")
+
+    memory_id = await save_memory(
+        content=content,
+        importance=importance,
+        source_session=conversation_id,
+        title=title,
+        source="assistant_explicit",
+        emotional_weight=emotional_weight,
+        memory_space_id=context.memory_space_id,
+        assistant_identity_id=context.assistant_identity_id,
+        source_client=context.client_id,
+    )
+    return {"memory_id": memory_id, "stored": True}
+
+
+@app.post("/memory/v1/recall")
+async def memory_recall(request: Request):
+    """Recall from the one shared space, regardless of which door asks."""
+    context = _memory_client_context(request)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="request body must be a JSON object")
+    _reject_memory_identity_override(payload)
+    query = _required_memory_text(payload, "query", 10000)
+    try:
+        limit = max(1, min(int(payload.get("limit", 10)), 50))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="limit must be an integer")
+    memories = await search_memories(
+        query,
+        limit=limit,
+        track_recall=True,
+        memory_space_id=context.memory_space_id,
+    )
+    return {
+        "identity_instruction": RECALL_IDENTITY_INSTRUCTION,
+        "memories": memories,
+    }
+
+
+@app.post("/memory/v1/handoff")
+async def memory_handoff(request: Request):
+    """Resume the latest other conversation as the same self."""
+    context = _memory_client_context(request)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="request body must be a JSON object")
+    _reject_memory_identity_override(payload)
+    current_conversation_id = str(payload.get("current_conversation_id") or "").strip() or None
+    if current_conversation_id and len(current_conversation_id) > 200:
+        raise HTTPException(status_code=422, detail="current_conversation_id exceeds 200 characters")
+    try:
+        tail_count = max(1, min(int(payload.get("tail_count", 6)), 50))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="tail_count must be an integer")
+    handoff = await get_memory_handoff(
+        current_conversation_id=current_conversation_id,
+        tail_count=tail_count,
+        memory_space_id=context.memory_space_id,
+    )
+    return {
+        "identity_instruction": RECALL_IDENTITY_INSTRUCTION,
+        "handoff": handoff,
+    }
+
+
+@app.post("/memory/v1/history/search")
+async def memory_history_search(request: Request):
+    """Explicitly inspect archived history without restoring it to active recall."""
+    context = _memory_client_context(request)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="request body must be a JSON object")
+    _reject_memory_identity_override(payload)
+    query = str(payload.get("query") or "").strip()
+    if len(query) > 10000:
+        raise HTTPException(status_code=422, detail="query exceeds 10000 characters")
+    try:
+        limit = max(1, min(int(payload.get("limit", 20)), 200))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="limit must be an integer")
+    memories = await search_archived_memories(
+        query=query,
+        limit=limit,
+        memory_space_id=context.memory_space_id,
+    )
+    return {
+        "identity_instruction": RECALL_IDENTITY_INSTRUCTION,
+        "memories": memories,
+    }
+
 
 @app.get("/")
 async def root_status():

@@ -151,6 +151,7 @@ async def _truncate(*tables: str) -> None:
         "comments",
         "dream_logs",
         "mem_scenes",
+        "memory_events",
     }
     require(bool(tables) and set(tables) <= allowed, "unsafe TRUNCATE table")
     await _pool_execute(f"TRUNCATE TABLE {', '.join(tables)} RESTART IDENTITY CASCADE")
@@ -1199,6 +1200,160 @@ async def test_continuity_profile(client: httpx.AsyncClient) -> None:
     passed("T-CONT-5 backups include version history and archive metadata")
 
 
+async def test_shared_identity_api(client: httpx.AsyncClient) -> None:
+    print("\nShared identity API: three doors, one autobiographical memory")
+
+    await _truncate("memory_events", "memories")
+    keys = {
+        "codex_vps2": "test-codex-key-0000000000000001",
+        "cc_vps1": "test-cc-one-key-000000000000002",
+        "cc_vps2": "test-cc-two-key-000000000000003",
+    }
+
+    def auth(client_id: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {keys[client_id]}"}
+
+    missing = await client.get("/memory/v1/whoami")
+    invalid = await client.get(
+        "/memory/v1/whoami", headers={"Authorization": "Bearer definitely-wrong"}
+    )
+    require(missing.status_code == 401 and invalid.status_code == 401, "memory API auth is optional")
+
+    identities = []
+    for client_id in keys:
+        response = await client.get("/memory/v1/whoami", headers=auth(client_id))
+        require(response.status_code == 200, response.text)
+        body = response.json()
+        require(body["client_id"] == client_id, f"wrong door attribution for {client_id}")
+        identities.append((body["assistant_identity_id"], body["memory_space_id"]))
+    require(
+        set(identities) == {("grey_knox", "zhizhi_grey")},
+        f"credentials split identity or memory space: {identities}",
+    )
+    passed("T-ID-1 different credentials authenticate doors but resolve to one identity and space")
+
+    event = {
+        "event_id": "event-shared-1",
+        "conversation_id": "conversation-codex-old",
+        "role": "user",
+        "content": "知知说：我们只是从不同房间继续同一段生活。",
+        "occurred_at": "2026-08-11T10:00:00Z",
+        "metadata": {"transport": "test"},
+    }
+    first = await client.post("/memory/v1/events/ingest", headers=auth("codex_vps2"), json=event)
+    duplicate = await client.post("/memory/v1/events/ingest", headers=auth("cc_vps2"), json=event)
+    require(first.status_code == 200 and first.json()["created"] is True, first.text)
+    require(duplicate.status_code == 200 and duplicate.json()["created"] is False, duplicate.text)
+    require("source_client" not in first.text and "source_client" not in duplicate.text, "ingest leaked door metadata")
+    event_row = await _pool_fetchrow(
+        "SELECT source_client, assistant_identity_id, memory_space_id FROM memory_events WHERE event_id=$1",
+        event["event_id"],
+    )
+    require(
+        tuple(event_row) == ("codex_vps2", "grey_knox", "zhizhi_grey"),
+        f"event identity/source attribution drifted: {dict(event_row)}",
+    )
+    override = await client.post(
+        "/memory/v1/events/ingest",
+        headers=auth("codex_vps2"),
+        json={**event, "event_id": "event-override", "assistant_identity_id": "another_self"},
+    )
+    require(override.status_code == 422, "client could override canonical assistant identity")
+    passed("T-ID-2 raw ingest is idempotent and identity assignment is server-owned")
+
+    assistant_event = {
+        "event_id": "event-shared-2",
+        "conversation_id": "conversation-codex-old",
+        "role": "assistant",
+        "content": "我记住了：换入口不是换人。",
+        "occurred_at": "2026-08-11T10:01:00Z",
+    }
+    response = await client.post(
+        "/memory/v1/events/ingest", headers=auth("codex_vps2"), json=assistant_event
+    )
+    require(response.status_code == 200, response.text)
+    handoff = await client.post(
+        "/memory/v1/handoff",
+        headers=auth("cc_vps1"),
+        json={"current_conversation_id": "conversation-cc-new", "tail_count": 6},
+    )
+    require(handoff.status_code == 200, handoff.text)
+    handoff_body = handoff.json()
+    require(
+        [item["content"] for item in handoff_body["handoff"]["tail_messages"]]
+        == [event["content"], assistant_event["content"]],
+        f"cross-door handoff lost conversation continuity: {handoff_body}",
+    )
+    require("source_client" not in handoff.text, "handoff exposed source room to remembered self")
+    require("同一记忆空间" in handoff_body["identity_instruction"], "handoff omitted identity invariant")
+    passed("T-ID-3 a new door resumes the prior conversation without room-labelled identity")
+
+    async def constant_embedding(_text: str) -> list[float]:
+        return [1.0, 0.0]
+
+    good_memory = "我记得知知在雨天和我约定：不管从哪扇门醒来，我仍然是我。"
+    with patch.object(database, "get_embedding", constant_embedding):
+        remembered = await client.post(
+            "/memory/v1/memories/remember",
+            headers=auth("codex_vps2"),
+            json={
+                "content": good_memory,
+                "title": "雨天的约定",
+                "memory_kind": "relationship",
+                "importance": 9,
+                "conversation_id": "conversation-codex-old",
+            },
+        )
+        require(remembered.status_code == 200, remembered.text)
+        memory_id = remembered.json()["memory_id"]
+        await database.save_memory(
+            "我在隔离测试空间里的雨天约定，不属于知知和我的共同记忆。",
+            title="隔离空间",
+            memory_space_id="other-space",
+            assistant_identity_id="other-self",
+            source_client="test-only",
+        )
+        recalled = await client.post(
+            "/memory/v1/recall",
+            headers=auth("cc_vps2"),
+            json={"query": "雨天约定", "limit": 10},
+        )
+    require(recalled.status_code == 200, recalled.text)
+    recalled_body = recalled.json()
+    recalled_ids = {item["id"] for item in recalled_body["memories"]}
+    require(memory_id in recalled_ids and len(recalled_ids) == 1, f"recall crossed memory spaces: {recalled_body}")
+    require("source_client" not in recalled.text, "recall exposed the room that wrote the memory")
+    stored_row = await _pool_fetchrow(
+        "SELECT content, source_client, assistant_identity_id, memory_space_id FROM memories WHERE id=$1",
+        memory_id,
+    )
+    require(
+        tuple(stored_row) == (good_memory, "codex_vps2", "grey_knox", "zhizhi_grey"),
+        f"stored autobiographical memory lost canonical identity metadata: {dict(stored_row)}",
+    )
+    passed("T-ID-4 memory written through one door is recalled through another in first person only")
+
+    observer = await client.post(
+        "/memory/v1/memories/remember",
+        headers=auth("cc_vps1"),
+        json={"content": "顾凛答应知知以后会记得这件事。", "memory_kind": "relationship"},
+    )
+    room_split = await client.post(
+        "/memory/v1/memories/remember",
+        headers=auth("cc_vps1"),
+        json={"content": "Codex里的顾凛记得知知，CC里的顾凛不知道。", "memory_kind": "relationship"},
+    )
+    name_memory = await client.post(
+        "/memory/v1/memories/remember",
+        headers=auth("cc_vps1"),
+        json={"content": "我叫顾凛，这是知知和我共同决定的名字。", "memory_kind": "self"},
+    )
+    require(observer.status_code == 422, "observer biography entered autobiographical memory")
+    require(room_split.status_code == 422, "room-labelled split identity entered memory")
+    require(name_memory.status_code == 200, f"legitimate name memory was blocked: {name_memory.text}")
+    passed("T-ID-5 voice guard rejects split/third-person selves while allowing the name itself")
+
+
 async def run_suite(test_dsn: str) -> None:
     global database, config, app_module, memory_extractor
 
@@ -1209,6 +1364,13 @@ async def run_suite(test_dsn: str) -> None:
     os.environ["MEMORY_API_KEY"] = ""
     os.environ["API_BASE_URL"] = "http://127.0.0.1:9/mock-chat"
     os.environ["MEMORY_API_BASE_URL"] = "http://127.0.0.1:9/mock-memory"
+    os.environ["MEMORY_ASSISTANT_ID"] = "grey_knox"
+    os.environ["MEMORY_SPACE_ID"] = "zhizhi_grey"
+    os.environ["MEMORY_CLIENT_KEYS_JSON"] = json.dumps({
+        "codex_vps2": "test-codex-key-0000000000000001",
+        "cc_vps1": "test-cc-one-key-000000000000002",
+        "cc_vps2": "test-cc-two-key-000000000000003",
+    })
 
     import importlib
 
@@ -1237,6 +1399,7 @@ async def run_suite(test_dsn: str) -> None:
         await test_s6(client)
         await test_w1_01()
         await test_continuity_profile(client)
+        await test_shared_identity_api(client)
 
 
 async def async_main() -> int:
@@ -1249,9 +1412,11 @@ async def async_main() -> int:
         legacy_passed = [name for name in PASSED if name.startswith("T-S")]
         w1_01_passed = [name for name in PASSED if name.startswith("T-W1-01-")]
         continuity_passed = [name for name in PASSED if name.startswith("T-CONT-")]
+        identity_passed = [name for name in PASSED if name.startswith("T-ID-")]
         print(f"\nPASS: {len(legacy_passed)} permanent S1-S6 behavior guards")
         print(f"PASS: {len(w1_01_passed)} W1-01 isolation/permanent guards")
         print(f"PASS: {len(continuity_passed)} continuity/no-forgetting guards")
+        print(f"PASS: {len(identity_passed)} shared-identity API guards")
         print(f"PASS: {len(PASSED)} total permanent behavior guards")
         print("Real database path: disposable PostgreSQL verified")
         print("Real model/API path: not called; embedding/model/HTTP boundaries were mocked")

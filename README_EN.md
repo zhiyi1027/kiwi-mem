@@ -76,6 +76,10 @@ If you use the project feature to separate different contexts (work in one proje
 
 No setup needed — isolation is automatic.
 
+### 🪞 Multiple doors, one autobiographical self
+
+The standalone `/memory/v1` API can be shared by Codex, Claude Code, and future API clients. Each door has a different credential, but credentials only record where a request entered. The server assigns one `assistant_identity_id` and one `memory_space_id`, and clients cannot override them. Semantic memories use the assistant's first-person voice; machine provenance remains audit metadata and never enters recalled prose, handoff context, or identity narration.
+
 ---
 
 ## Who is it for
@@ -128,7 +132,7 @@ Visit `http://localhost:8080` — if you see `{"status":"running"}`, you're good
 - Point your chat client's API endpoint to `http://localhost:8080/v1`
 - Works with any OpenAI-format frontend: ChatBox, NextChat, SillyTavern, or your own
 
-> 🔓 **kiwi-mem has no built-in authentication.** If you expose it to the public Internet, protect the entire service with Cloudflare Access, reverse-proxy Basic Auth, or an IP allowlist. Pay special attention to `/admin`, `/sync/export` (which may export API keys in the full configuration backup), and `/sync/import-backup` (which restores the full configuration). These endpoints are not authenticated by kiwi-mem itself.
+> 🔐 The shared-identity `/memory/v1/*` API requires its own Bearer credentials. The legacy chat gateway, admin panel, debug, and sync endpoints still have no built-in authentication. Keep the service on a private network or Tailscale, or protect the whole service with Cloudflare Access, reverse-proxy authentication, or an IP allowlist. Pay special attention to `/admin`, `/sync/export`, and `/sync/import-backup`.
 
 > 💡 80+ parameters can be changed at runtime via the admin panel — no restart needed.
 
@@ -255,6 +259,9 @@ Memory import is being rebuilt and will return in a future version in a smarter 
 |---|---|---|
 | `DATABASE_URL` | PostgreSQL connection string (auto-configured by Docker Compose) | — |
 | `MEMORY_ENABLED` | Enable memory system | `true` |
+| `MEMORY_ASSISTANT_ID` | Assistant identity shared by every memory door | `grey_knox` |
+| `MEMORY_SPACE_ID` | Memory space shared by every memory door | `zhizhi_grey` |
+| `MEMORY_CLIENT_KEYS_JSON` | JSON map from door names to Bearer keys | — |
 | `DEFAULT_MODEL` | Default chat model | `anthropic/claude-sonnet-4` |
 | `PORT` | Gateway port | `8080` |
 | `MAX_MEMORIES_INJECT` | Max memories per injection | `15` |
@@ -301,6 +308,12 @@ Memory import is being rebuilt and will return in a future version in a smarter 
 ### Memories
 | Path | Method | Description |
 |---|---|---|
+| `/memory/v1/whoami` | GET | Authenticate a door and return the canonical identity (Bearer required) |
+| `/memory/v1/events/ingest` | POST | Idempotently append raw dialogue evidence (Bearer required) |
+| `/memory/v1/memories/remember` | POST | Explicitly store first-person semantic memory (Bearer required) |
+| `/memory/v1/recall` | POST | Recall from the shared memory space (Bearer required) |
+| `/memory/v1/handoff` | POST | Continue the latest conversation across doors/windows (Bearer required) |
+| `/memory/v1/history/search` | POST | Explicitly search archived history (Bearer required) |
 | `/debug/memories` | GET | List / search (`?q=`) |
 | `/debug/memories` | POST | Create |
 | `/debug/memories/{id}` | PUT / DELETE | Update / delete |

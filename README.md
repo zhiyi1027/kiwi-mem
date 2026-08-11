@@ -76,6 +76,10 @@ kiwi-mem 内置了 20 多个工具（记忆搜索、日历查询、提醒、联�
 
 你不需要做任何设置，隔离是自动的。
 
+### 🪞 多个入口，仍是同一个“我”
+
+独立的 `/memory/v1` API 可以同时供 Codex、Claude Code 和未来的 API 客户端使用。每个入口使用不同密钥，密钥只记录请求从哪扇门进来；`assistant_identity_id` 与 `memory_space_id` 由服务器统一指定，客户端不能覆盖。语义记忆以助手第一人称保存，来源机器只留在审计元数据中，不进入召回正文、换窗上下文或身份叙述。
+
 ---
 
 ## 适合谁用
@@ -171,7 +175,7 @@ nano .env
 API_KEY=
 ```
 
-> 🔓 **kiwi-mem 不带访问密码。** 网关和管理面板默认不需要任何登录口令——这样最省心，不会再有人卡在 401。代价是：**任何知道你网关地址的人都能访问全部 API。** 如果服务暴露在公网，请用 Cloudflare Access、反向代理的 Basic Auth、IP 白名单等手段保护整个服务，尤其是 `/admin`、会导出完整配置（可能含 API Key）的 `/sync/export`，以及会恢复完整配置的 `/sync/import-backup`。这些端点目前没有内建鉴权。
+> 🔐 `/memory/v1/*` 共享身份记忆 API 使用独立 Bearer 密钥鉴权。旧版聊天网关、管理面板和调试/同步端点仍没有内建鉴权；请只在私网或 Tailscale 内开放，或使用 Cloudflare Access、反向代理鉴权、IP 白名单保护整个服务。尤其要保护 `/admin`、`/sync/export` 和 `/sync/import-backup`。
 
 保存后启动：
 ```bash
@@ -400,6 +404,9 @@ https://你的域名/admin
 |---|---|---|
 | `DATABASE_URL` | PostgreSQL 连接串（Docker Compose 自动配置） | — |
 | `MEMORY_ENABLED` | 记忆系统开关 | `true` |
+| `MEMORY_ASSISTANT_ID` | 所有记忆入口共享的助手身份 ID | `grey_knox` |
+| `MEMORY_SPACE_ID` | 所有记忆入口共享的空间 ID | `zhizhi_grey` |
+| `MEMORY_CLIENT_KEYS_JSON` | 入口名到 Bearer 密钥的 JSON 映射 | — |
 | `DEFAULT_MODEL` | 默认聊天模型 | `anthropic/claude-sonnet-4` |
 | `PORT` | 端口 | `8080` |
 | `MAX_MEMORIES_INJECT` | 每次注入最大记忆条数 | `15` |
@@ -446,6 +453,12 @@ https://你的域名/admin
 ### 记忆
 | 路径 | 方法 | 说明 |
 |---|---|---|
+| `/memory/v1/whoami` | GET | 验证入口并返回统一身份（需 Bearer 密钥） |
+| `/memory/v1/events/ingest` | POST | 幂等写入原始对话事件（需 Bearer 密钥） |
+| `/memory/v1/memories/remember` | POST | 主动写入第一人称语义记忆（需 Bearer 密钥） |
+| `/memory/v1/recall` | POST | 从统一记忆空间召回（需 Bearer 密钥） |
+| `/memory/v1/handoff` | POST | 跨入口/换窗接续最近对话（需 Bearer 密钥） |
+| `/memory/v1/history/search` | POST | 显式搜索冷归档历史（需 Bearer 密钥） |
 | `/debug/memories` | GET | 列表 / 搜索（`?q=`） |
 | `/debug/memories` | POST | 创建 |
 | `/debug/memories/{id}` | PUT / DELETE | 更新 / 删除 |
