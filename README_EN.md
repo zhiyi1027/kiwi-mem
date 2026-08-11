@@ -82,6 +82,8 @@ The standalone `/memory/v1` API can be shared by Codex, Claude Code, and future 
 
 The same narrative contract covers automatic extraction, daily consolidation, Dream merge/softening, MemScenes, calendar summaries, and the user profile, and is appended after any custom prompt. Automatic extraction reads only the current session, so concurrent windows cannot be spliced into a conversation that never happened. Assistant memories use first person; facts about Zhizhi use “Zhizhi/she.” Invalid generated output is not stored and cannot retire its source memories first.
 
+The first-person contract governs the assistant's internal semantic memories only. The complete transcript archive is a shared external viewer, so its role labels are shown as “知知/Lyra” and “凛/Grey.”
+
 ---
 
 ## Who is it for

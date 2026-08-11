@@ -33,7 +33,8 @@ def main() -> None:
     require("key: 'archive'" in routes, "admin navigation lost the transcript archive")
     require("sessionStorage" in archive_page, "archive credential is not tab-scoped")
     require("localStorage" not in archive_page, "archive credential persists beyond the browser tab")
-    require("'知知'" in archive_page and "'我'" in archive_page, "archive UI lost first-person labels")
+    require("'知知/Lyra'" in archive_page and "'凛/Grey'" in archive_page,
+            "archive UI lost the shared display names")
     require("source_client" not in archive_page, "archive UI anchors identity to a source room")
 
     require("${KIWI_BIND_IP:-127.0.0.1}" in compose, "Docker no longer binds privately by default")

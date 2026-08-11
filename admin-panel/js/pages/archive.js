@@ -3,6 +3,9 @@ import { jfetch, escHtml, fmtDateTime } from '../api.js';
 import { emptyState, loadingBlock, toast, delegate } from '../ui.js';
 
 const TOKEN_KEY = 'kiwi-archive-session-token';
+// 归档页是知知与凛共同翻阅的外部界面，不是助手内部的记忆叙述。
+// 因此界面显示双方名字；“我 / 知知”的第一人称契约仍只约束语义记忆正文。
+const roleLabel = role => role === 'user' ? '知知/Lyra' : role === 'assistant' ? '凛/Grey' : '系统记录';
 
 export default {
   title: '聊天归档',
@@ -151,7 +154,7 @@ export default {
     if (!this.state.events.length) box.innerHTML = emptyState({ msg: '这段会话没有可见原文' });
     else box.innerHTML = `<div class="archive-messages">${this.state.events.map(e => `
       <article class="archive-message role-${escHtml(e.role)}">
-        <header><b>${e.role === 'user' ? '知知' : e.role === 'assistant' ? '我' : '系统记录'}</b><time>${fmtDateTime(e.occurred_at)}</time></header>
+        <header><b>${roleLabel(e.role)}</b><time>${fmtDateTime(e.occurred_at)}</time></header>
         <div>${escHtml(e.content || '')}</div>
       </article>`).join('')}</div>`;
     this.root.querySelector('#archive-event-more').innerHTML = this.state.eventCursor
@@ -169,7 +172,7 @@ export default {
       box.innerHTML = matches.length ? matches.map(e => `
         <button class="archive-conversation" data-act="conversation" data-id="${escHtml(e.conversation_id)}">
           <span class="archive-conv-main"><b>${escHtml((e.content || '').slice(0, 120))}</b>
-          <small>${e.role === 'user' ? '知知' : e.role === 'assistant' ? '我' : '系统记录'} · ${fmtDateTime(e.occurred_at)}</small></span>
+          <small>${roleLabel(e.role)} · ${fmtDateTime(e.occurred_at)}</small></span>
         </button>`).join('') : emptyState({ msg: '没有找到这句原话' });
       this.root.querySelector('#archive-conv-more').innerHTML = '';
     } catch (e) { box.innerHTML = `<div class="banner banner-warn"><span>⚠️</span><div>${escHtml(e.message)}</div></div>`; }
