@@ -337,8 +337,11 @@ async def test_s1(client: httpx.AsyncClient) -> None:
     for endpoint in ("/admin", "/sync/export", "/sync/import-backup"):
         require(endpoint in readme_zh and endpoint in readme_en, f"README warning misses {endpoint}")
     require("整个" in readme_zh and "entire service" in readme_en, "whole-service warning missing")
-    require("没有内建鉴权" in readme_zh, "Chinese README must disclose missing built-in auth")
-    require("not authenticated" in readme_en, "README must not claim built-in authentication")
+    require("管理密钥" in readme_zh and "SHA-256" in readme_zh, "Chinese README omits admin digest authentication")
+    require("admin Bearer" in readme_en and "SHA-256" in readme_en, "English README omits admin digest authentication")
+    require("聊天网关与 MCP" in readme_zh, "Chinese README hides the remaining public-boundary gap")
+    require("not public-Internet authentication boundaries" in readme_en,
+            "English README hides the remaining public-boundary gap")
     passed("T-S1-8 bilingual deployment warning")
 
 
