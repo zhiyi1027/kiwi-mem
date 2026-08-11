@@ -19,6 +19,7 @@ export const NAV = [
   { title: '人设与记忆', items: [
     { key: 'persona',     icon: '📝', label: '人设' },
     { key: 'profile',     icon: '👤', label: '用户画像' },
+    { key: 'archive',     icon: '📖', label: '聊天归档' },
     { key: 'memories',    icon: '🧩', label: '记忆碎片' },
     { key: 'categories',  icon: '🏷️', label: '碎片分类' },
   ]},
@@ -48,6 +49,7 @@ export const LEDES = {
   tools:      ['工具按需拿，不浪费 token', '每句话只把可能用到的工具递给模型；外部 MCP 按语义自动展开。'],
   persona:    ['AI 是谁、怎么说话', '最顶层的 system prompt，整条消息旅程里最静态的一层。'],
   profile:    ['AI 眼中的你', '由每日整理自动更新的结构化认知，注入缓存静态层。'],
+  archive:    ['你和我逐字说过的话', '不可变的原文归档：按会话翻阅、搜索，不参与 Dream 重写或衰减。'],
   memories:   ['记忆的原子单位', '每条碎片带重要度、热度、分类与锁定；会淡忘，也会因反复提起而升温。'],
   categories: ['给碎片打标签', '纯组织手段，便于筛选，不影响检索逻辑。'],
   metabolism: ['记忆如何淡忘与变牢', '热度衰减、夜间软化、自动锁定与退役——这页是遗忘曲线的旋钮。'],

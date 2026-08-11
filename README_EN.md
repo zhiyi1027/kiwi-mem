@@ -134,7 +134,7 @@ Visit `http://localhost:8080` — if you see `{"status":"running"}`, you're good
 - Point your chat client's API endpoint to `http://localhost:8080/v1`
 - Works with any OpenAI-format frontend: ChatBox, NextChat, SillyTavern, or your own
 
-> 🔐 The shared-identity `/memory/v1/*` API requires its own Bearer credentials. The legacy chat gateway, admin panel, debug, and sync endpoints still have no built-in authentication. Keep the service on a private network or Tailscale, or protect the entire service with Cloudflare Access, reverse-proxy authentication, or an IP allowlist. Pay special attention to `/admin`, `/sync/export`, and `/sync/import-backup`; these legacy endpoints are not authenticated by kiwi-mem itself.
+> 🔐 The shared-identity `/memory/v1/*` API requires its own Bearer credentials. The legacy chat gateway, admin panel, debug, and sync endpoints still have no built-in authentication. Keep the service on a private network or Tailscale, or protect the entire service with Cloudflare Access, reverse-proxy authentication, or an IP allowlist. Pay special attention to `/admin`, `/sync/export`, and `/sync/import-backup`; these legacy endpoints are not authenticated by kiwi-mem itself. Once complete transcript archiving is enabled, the service stores verbatim dialogue and must not be exposed directly to the public Internet. Docker Compose binds to `127.0.0.1` by default; set `KIWI_BIND_IP` to a private/Tailscale address for cross-host access.
 
 > 💡 80+ parameters can be changed at runtime via the admin panel — no restart needed.
 
@@ -261,6 +261,8 @@ Memory import is being rebuilt and will return in a future version in a smarter 
 |---|---|---|
 | `DATABASE_URL` | PostgreSQL connection string (auto-configured by Docker Compose) | — |
 | `MEMORY_ENABLED` | Enable memory system | `true` |
+| `CHAT_ARCHIVE_ENABLED` | Automatically archive visible gateway dialogue (sensitive, opt-in) | `false` |
+| `KIWI_BIND_IP` | Docker host bind address | `127.0.0.1` |
 | `MEMORY_ASSISTANT_ID` | Assistant identity shared by every memory door | `grey_knox` |
 | `MEMORY_SPACE_ID` | Memory space shared by every memory door | `zhizhi_grey` |
 | `MEMORY_CLIENT_KEYS_JSON` | JSON map from door names to Bearer keys | — |
@@ -312,6 +314,10 @@ Memory import is being rebuilt and will return in a future version in a smarter 
 |---|---|---|
 | `/memory/v1/whoami` | GET | Authenticate a door and return the canonical identity (Bearer required) |
 | `/memory/v1/events/ingest` | POST | Idempotently append raw dialogue evidence (Bearer required) |
+| `/memory/v1/events/ingest-batch` | POST | Atomically replay up to 500 raw events after disconnect (Bearer required) |
+| `/memory/v1/archive/conversations` | GET | Cursor-page the archived conversation directory (Bearer required) |
+| `/memory/v1/archive/conversations/{id}` | GET | Cursor-page one immutable verbatim transcript (Bearer required) |
+| `/memory/v1/archive/search` | POST | Search exact words in complete transcript history (Bearer required) |
 | `/memory/v1/memories/remember` | POST | Explicitly store first-person semantic memory (Bearer required) |
 | `/memory/v1/recall` | POST | Recall from the shared memory space (Bearer required) |
 | `/memory/v1/handoff` | POST | Continue the latest conversation across doors/windows (Bearer required) |

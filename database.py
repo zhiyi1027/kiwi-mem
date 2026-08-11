@@ -1248,7 +1248,35 @@ async def ingest_memory_event(
     """Append one raw event, idempotently, without modifying prior evidence."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
+        return await _ingest_memory_event_conn(
+            conn,
+            event_id=event_id,
+            source_client=source_client,
+            conversation_id=conversation_id,
+            role=role,
+            content=content,
+            occurred_at=occurred_at,
+            metadata=metadata,
+            memory_space_id=memory_space_id,
+            assistant_identity_id=assistant_identity_id,
+        )
+
+
+async def _ingest_memory_event_conn(
+    conn,
+    *,
+    event_id: str,
+    source_client: str,
+    conversation_id: str,
+    role: str,
+    content: str,
+    occurred_at: datetime,
+    metadata: dict | None,
+    memory_space_id: str,
+    assistant_identity_id: str,
+) -> dict:
+    """Insert one immutable event using an existing connection/transaction."""
+    row = await conn.fetchrow("""
             INSERT INTO memory_events (
                 event_id, memory_space_id, assistant_identity_id, source_client,
                 conversation_id, role, content, occurred_at, metadata
@@ -1259,14 +1287,168 @@ async def ingest_memory_event(
         """, event_id, memory_space_id, assistant_identity_id, source_client,
              conversation_id, role, content, occurred_at,
              json.dumps(metadata or {}, ensure_ascii=False))
-        if row:
-            return {"created": True, "event_id": row["event_id"], "created_at": row["created_at"]}
-        existing = await conn.fetchrow("""
+    if row:
+        return {"created": True, "event_id": row["event_id"], "created_at": row["created_at"]}
+    existing = await conn.fetchrow("""
             SELECT event_id, memory_space_id, assistant_identity_id,
-                   source_client, conversation_id, role, content, occurred_at, created_at
+                   source_client, conversation_id, role, content, occurred_at,
+                   metadata, created_at
             FROM memory_events WHERE event_id = $1
         """, event_id)
-        return {"created": False, **dict(existing)} if existing else {"created": False, "event_id": event_id}
+    if not existing:
+        return {"created": False, "event_id": event_id}
+
+    # An idempotency key may be retried, but it must never be reused for a
+    # different utterance.  occurred_at is intentionally excluded so a client
+    # that omitted its timestamp can safely retry after a timeout.
+    immutable_match = (
+        existing["memory_space_id"] == memory_space_id
+        and existing["assistant_identity_id"] == assistant_identity_id
+        and existing["conversation_id"] == conversation_id
+        and existing["role"] == role
+        and existing["content"] == content
+    )
+    if not immutable_match:
+        raise ValueError("event_id is already bound to different immutable dialogue evidence")
+    return {"created": False, **dict(existing)}
+
+
+async def ingest_memory_events(
+    events: list[dict],
+    *,
+    source_client: str,
+    memory_space_id: str = CANONICAL_MEMORY_SPACE_ID,
+    assistant_identity_id: str = CANONICAL_ASSISTANT_ID,
+) -> list[dict]:
+    """Atomically replay a batch of immutable events after a disconnect."""
+    if not events:
+        return []
+    pool = await get_pool()
+    results = []
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            for event in events:
+                results.append(await _ingest_memory_event_conn(
+                    conn,
+                    event_id=event["event_id"],
+                    source_client=source_client,
+                    conversation_id=event["conversation_id"],
+                    role=event["role"],
+                    content=event["content"],
+                    occurred_at=event["occurred_at"],
+                    metadata=event.get("metadata"),
+                    memory_space_id=memory_space_id,
+                    assistant_identity_id=assistant_identity_id,
+                ))
+    return results
+
+
+async def list_memory_event_conversations(
+    *,
+    memory_space_id: str = CANONICAL_MEMORY_SPACE_ID,
+    limit: int = 50,
+    before_at: datetime = None,
+    before_conversation_id: str = None,
+    source_client: str = None,
+) -> list[dict]:
+    """List archived conversations newest-first using stable keyset paging."""
+    safe_limit = max(1, min(int(limit or 50), 200))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            WITH summaries AS (
+                SELECT
+                    conversation_id,
+                    MIN(occurred_at) AS first_event_at,
+                    MAX(occurred_at) AS last_event_at,
+                    COUNT(*) FILTER (WHERE role IN ('user', 'assistant')) AS message_count,
+                    COUNT(*) FILTER (WHERE role = 'user') AS user_message_count,
+                    COUNT(*) FILTER (WHERE role = 'assistant') AS assistant_message_count,
+                    ARRAY_AGG(DISTINCT source_client) AS source_clients,
+                    (ARRAY_AGG(content ORDER BY occurred_at DESC, event_id DESC)
+                        FILTER (WHERE role IN ('user', 'assistant')))[1] AS preview
+                FROM memory_events
+                WHERE memory_space_id = $1
+                  AND ($2::text IS NULL OR source_client = $2)
+                GROUP BY conversation_id
+            )
+            SELECT * FROM summaries
+            WHERE message_count > 0
+              AND (
+                    $3::timestamptz IS NULL
+                    OR (last_event_at, conversation_id) < ($3, $4)
+              )
+            ORDER BY last_event_at DESC, conversation_id DESC
+            LIMIT $5
+        """, memory_space_id, source_client, before_at,
+             before_conversation_id or "", safe_limit)
+    return [dict(row) for row in rows]
+
+
+async def get_memory_event_conversation_page(
+    conversation_id: str,
+    *,
+    memory_space_id: str = CANONICAL_MEMORY_SPACE_ID,
+    limit: int = 100,
+    before_at: datetime = None,
+    before_event_id: str = None,
+    include_system: bool = False,
+) -> list[dict]:
+    """Read one immutable transcript page newest-first."""
+    safe_limit = max(1, min(int(limit or 100), 500))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT event_id, conversation_id, role, content, occurred_at,
+                   source_client, metadata, created_at
+            FROM memory_events
+            WHERE memory_space_id = $1
+              AND conversation_id = $2
+              AND ($3::bool OR role <> 'system')
+              AND (
+                    $4::timestamptz IS NULL
+                    OR (occurred_at, event_id) < ($4, $5)
+              )
+            ORDER BY occurred_at DESC, event_id DESC
+            LIMIT $6
+        """, memory_space_id, conversation_id, include_system,
+             before_at, before_event_id or "", safe_limit)
+    return [dict(row) for row in rows]
+
+
+async def search_memory_events(
+    query: str,
+    *,
+    memory_space_id: str = CANONICAL_MEMORY_SPACE_ID,
+    limit: int = 50,
+    before_at: datetime = None,
+    before_event_id: str = None,
+    conversation_id: str = None,
+    source_client: str = None,
+    role: str = None,
+) -> list[dict]:
+    """Literal full-text search over immutable dialogue evidence."""
+    safe_limit = max(1, min(int(limit or 50), 200))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT event_id, conversation_id, role, content, occurred_at,
+                   source_client, metadata, created_at
+            FROM memory_events
+            WHERE memory_space_id = $1
+              AND STRPOS(LOWER(content), LOWER($2)) > 0
+              AND ($3::text IS NULL OR conversation_id = $3)
+              AND ($4::text IS NULL OR source_client = $4)
+              AND ($5::text IS NULL OR role = $5)
+              AND (
+                    $6::timestamptz IS NULL
+                    OR (occurred_at, event_id) < ($6, $7)
+              )
+            ORDER BY occurred_at DESC, event_id DESC
+            LIMIT $8
+        """, memory_space_id, query, conversation_id, source_client, role,
+             before_at, before_event_id or "", safe_limit)
+    return [dict(row) for row in rows]
 
 
 async def get_memory_handoff(

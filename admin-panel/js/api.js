@@ -31,7 +31,7 @@ export async function jfetch(path, opts = {}) {
     if (!res.ok) throw new Error(`服务器错误 (${res.status})`);
     return text; // non-JSON body (rare)
   }
-  if (!res.ok) throw new Error(data?.error || `服务器错误 (${res.status})`);
+  if (!res.ok) throw new Error(data?.error || data?.detail || `服务器错误 (${res.status})`);
   if (data && typeof data === 'object' && !Array.isArray(data) && data.error) {
     throw new Error(data.error);
   }

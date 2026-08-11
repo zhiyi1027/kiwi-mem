@@ -19,6 +19,7 @@ from database import get_pool
 
 CONFIG_SCHEMA = {
     "memory_enabled":        ("MEMORY_ENABLED",         "true",  "记忆系统开关",      "bool"),
+    "chat_archive_enabled":  ("CHAT_ARCHIVE_ENABLED",   "false", "完整聊天原文归档",  "bool"),
     "extract_interval":      ("MEMORY_EXTRACT_INTERVAL", "5",    "提取间隔（轮）",    "int"),
     "max_inject":            ("MAX_MEMORIES_INJECT",     "15",   "每次注入条数",      "int"),
     "locked_inject_ratio":   ("",                        "0.2",  "锁定保底占比",      "float"),

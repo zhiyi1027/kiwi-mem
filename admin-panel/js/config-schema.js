@@ -19,6 +19,7 @@
 export const CONFIG_META = {
   // —— 记忆基础 ——
   memory_enabled:        { label:'记忆系统总开关', type:'bool', def:'true', input:'bool', desc:'关闭后不提取记忆、不注入碎片，但对话仍正常保存转发。' },
+  chat_archive_enabled:  { label:'完整聊天原文归档', type:'bool', def:'false', input:'bool', desc:'自动保存经过网关的知知/我双方可见原文。属于高敏感数据，只应在私网或 Tailscale 内开启。' },
   extract_interval:      { label:'提取间隔（轮）', type:'int', def:'5', input:'int', desc:'每隔多少轮对话提取一次记忆。越小越频繁但更费 token。建议 3–10。' },
   max_inject:            { label:'每次注入条数', type:'int', def:'15', input:'int', desc:'每次对话注入多少条语义相关碎片。太多占 token，太少易遗漏。建议 5–30。' },
   locked_inject_ratio:   { label:'锁定保底占比', type:'float', def:'0.2', input:'float', desc:'命中的锁定记忆至少占据注入名额的比例。0 = 与普通碎片纯竞争，1 = 全部名额都可被锁定记忆保底占用。' },

@@ -14,6 +14,8 @@ Kiwi-Mem — 带记忆系统的 LLM 转发网关
 
 import os
 import json
+import base64
+import binascii
 import hashlib
 import uuid
 import asyncio
@@ -21,6 +23,7 @@ import copy
 import math
 import httpx
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,7 +34,8 @@ from database import (
     get_all_memories_count, get_recent_memories, get_recent_messages, get_latest_conversation_session_id, delete_memory,
     batch_delete_memories_guarded, clear_all_memories, update_memory, check_memory_duplicate,
     search_archived_memories, get_memory_versions,
-    ingest_memory_event, get_memory_handoff,
+    ingest_memory_event, ingest_memory_events, get_memory_handoff,
+    list_memory_event_conversations, get_memory_event_conversation_page, search_memory_events,
     migrate_embeddings, backfill_permanent_memory_embeddings, get_embedding_stats,
     # v5.3 时间有效期 + 矛盾检测
     invalidate_memory, create_memory_edge, detect_contradictions,
@@ -84,6 +88,7 @@ PORT = int(os.getenv("PORT", "8080"))
 
 # 记忆系统开关（数据库出问题时可以临时关掉）
 MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "true" if os.getenv("DATABASE_URL") else "false").lower() == "true"
+CHAT_ARCHIVE_ENABLED = os.getenv("CHAT_ARCHIVE_ENABLED", "false").lower() == "true"
 
 # 每次注入的最大记忆条数
 MAX_MEMORIES_INJECT = int(os.getenv("MAX_MEMORIES_INJECT", "15"))
@@ -105,6 +110,14 @@ async def get_memory_enabled() -> bool:
         return await get_config_bool("memory_enabled", fallback=MEMORY_ENABLED)
     except Exception:
         return MEMORY_ENABLED
+
+
+async def get_chat_archive_enabled() -> bool:
+    """Read the opt-in immutable transcript archive switch."""
+    try:
+        return await get_config_bool("chat_archive_enabled", fallback=CHAT_ARCHIVE_ENABLED)
+    except Exception:
+        return CHAT_ARCHIVE_ENABLED
 
 async def get_max_inject() -> int:
     """读取注入条数（动态）"""
@@ -356,6 +369,17 @@ def _required_memory_text(payload: dict, field: str, max_length: int) -> str:
     return value
 
 
+def _required_memory_content(payload: dict, field: str = "content", max_length: int = 200000) -> str:
+    """Validate raw evidence without trimming any verbatim whitespace."""
+    raw = payload.get(field)
+    value = "" if raw is None else str(raw)
+    if not value.strip():
+        raise HTTPException(status_code=422, detail=f"{field} must not be empty")
+    if len(value) > max_length:
+        raise HTTPException(status_code=422, detail=f"{field} exceeds {max_length} characters")
+    return value
+
+
 def _parse_memory_event_time(value):
     if value in (None, ""):
         return datetime.now(timezone.utc)
@@ -370,11 +394,54 @@ def _parse_memory_event_time(value):
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
 
+
+def _encode_archive_cursor(occurred_at: datetime, item_id: str) -> str:
+    payload = json.dumps(
+        {"at": occurred_at.astimezone(timezone.utc).isoformat(), "id": str(item_id)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_archive_cursor(value: str) -> tuple[datetime | None, str | None]:
+    cursor = str(value or "").strip()
+    if not cursor:
+        return None, None
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+        occurred_at = _parse_memory_event_time(payload.get("at"))
+        item_id = str(payload.get("id") or "")
+        if not item_id:
+            raise ValueError("missing cursor id")
+        return occurred_at, item_id
+    except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error):
+        raise HTTPException(status_code=422, detail="invalid archive cursor")
+
+
+def _prepare_memory_event_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="event must be a JSON object")
+    _reject_memory_identity_override(payload)
+    role = str(payload.get("role") or "").strip().lower()
+    if role not in {"user", "assistant", "system"}:
+        raise HTTPException(status_code=422, detail="role must be user, assistant, or system")
+    metadata = payload.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise HTTPException(status_code=422, detail="metadata must be a JSON object")
+    return {
+        "event_id": _required_memory_text(payload, "event_id", 200),
+        "conversation_id": _required_memory_text(payload, "conversation_id", 200),
+        "role": role,
+        "content": _required_memory_content(payload),
+        "occurred_at": _parse_memory_event_time(payload.get("occurred_at")),
+        "metadata": metadata,
+    }
+
 # ============================================================
 # 模板变量替换
 # ============================================================
-
-from datetime import datetime, timezone, timedelta
 
 TZ_CST = timezone(timedelta(hours=8))  # 东八区
 
@@ -1455,31 +1522,172 @@ async def memory_ingest_event(request: Request):
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=422, detail="request body must be a JSON object")
-    _reject_memory_identity_override(payload)
-
-    event_id = _required_memory_text(payload, "event_id", 200)
-    conversation_id = _required_memory_text(payload, "conversation_id", 200)
-    content = _required_memory_text(payload, "content", 200000)
-    role = str(payload.get("role") or "").strip().lower()
-    if role not in {"user", "assistant", "system"}:
-        raise HTTPException(status_code=422, detail="role must be user, assistant, or system")
-    metadata = payload.get("metadata", {})
-    if not isinstance(metadata, dict):
-        raise HTTPException(status_code=422, detail="metadata must be a JSON object")
-
-    result = await ingest_memory_event(
-        event_id=event_id,
-        source_client=context.client_id,
-        conversation_id=conversation_id,
-        role=role,
-        content=content,
-        occurred_at=_parse_memory_event_time(payload.get("occurred_at")),
-        metadata=metadata,
-        memory_space_id=context.memory_space_id,
-        assistant_identity_id=context.assistant_identity_id,
-    )
+    event = _prepare_memory_event_payload(payload)
+    try:
+        result = await ingest_memory_event(
+            event_id=event["event_id"],
+            source_client=context.client_id,
+            conversation_id=event["conversation_id"],
+            role=event["role"],
+            content=event["content"],
+            occurred_at=event["occurred_at"],
+            metadata=event["metadata"],
+            memory_space_id=context.memory_space_id,
+            assistant_identity_id=context.assistant_identity_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     # Source metadata stays available for audit in PostgreSQL, never in recalled prose.
-    return {"created": bool(result.get("created")), "event_id": result.get("event_id", event_id)}
+    return {"created": bool(result.get("created")), "event_id": result.get("event_id", event["event_id"])}
+
+
+@app.post("/memory/v1/events/ingest-batch")
+async def memory_ingest_event_batch(request: Request):
+    """Atomically replay up to 500 archived messages after an offline period."""
+    context = _memory_client_context(request)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="request body must be a JSON object")
+    _reject_memory_identity_override(payload)
+    raw_events = payload.get("events")
+    if not isinstance(raw_events, list) or not raw_events:
+        raise HTTPException(status_code=422, detail="events must be a non-empty array")
+    if len(raw_events) > 500:
+        raise HTTPException(status_code=422, detail="events exceeds batch limit 500")
+    events = [_prepare_memory_event_payload(event) for event in raw_events]
+    if len({event["event_id"] for event in events}) != len(events):
+        raise HTTPException(status_code=422, detail="event_id must be unique within a batch")
+    try:
+        results = await ingest_memory_events(
+            events,
+            source_client=context.client_id,
+            memory_space_id=context.memory_space_id,
+            assistant_identity_id=context.assistant_identity_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    created = sum(1 for result in results if result.get("created"))
+    return {
+        "received": len(results),
+        "created": created,
+        "duplicates": len(results) - created,
+        "event_ids": [result["event_id"] for result in results],
+    }
+
+
+@app.get("/memory/v1/archive/conversations")
+async def memory_archive_conversations(
+    request: Request,
+    limit: int = 50,
+    cursor: str = "",
+    source_client: str = "",
+):
+    """List complete archived conversations without exposing machine identity in prose."""
+    context = _memory_client_context(request)
+    limit = max(1, min(int(limit), 200))
+    if len(source_client) > 200:
+        raise HTTPException(status_code=422, detail="source_client exceeds 200 characters")
+    before_at, before_id = _decode_archive_cursor(cursor)
+    rows = await list_memory_event_conversations(
+        memory_space_id=context.memory_space_id,
+        limit=limit + 1,
+        before_at=before_at,
+        before_conversation_id=before_id,
+        source_client=source_client.strip() or None,
+    )
+    has_more = len(rows) > limit
+    visible = rows[:limit]
+    next_cursor = None
+    if has_more and visible:
+        next_cursor = _encode_archive_cursor(visible[-1]["last_event_at"], visible[-1]["conversation_id"])
+    conversations = []
+    for row in visible:
+        item = dict(row)
+        item["preview"] = str(item.get("preview") or "")[:500]
+        conversations.append(item)
+    return {"conversations": conversations, "next_cursor": next_cursor}
+
+
+@app.get("/memory/v1/archive/conversations/{conversation_id}")
+async def memory_archive_conversation(
+    conversation_id: str,
+    request: Request,
+    limit: int = 100,
+    cursor: str = "",
+    include_system: bool = False,
+):
+    """Read one transcript page; rows are immutable and never rewritten by Dream."""
+    context = _memory_client_context(request)
+    conversation_id = str(conversation_id or "").strip()
+    if not conversation_id or len(conversation_id) > 200:
+        raise HTTPException(status_code=422, detail="invalid conversation_id")
+    limit = max(1, min(int(limit), 500))
+    before_at, before_id = _decode_archive_cursor(cursor)
+    rows = await get_memory_event_conversation_page(
+        conversation_id,
+        memory_space_id=context.memory_space_id,
+        limit=limit + 1,
+        before_at=before_at,
+        before_event_id=before_id,
+        include_system=include_system,
+    )
+    has_more = len(rows) > limit
+    visible = rows[:limit]
+    next_cursor = None
+    if has_more and visible:
+        next_cursor = _encode_archive_cursor(visible[-1]["occurred_at"], visible[-1]["event_id"])
+    return {
+        "conversation_id": conversation_id,
+        "events": list(reversed(visible)),
+        "page_order": "oldest_to_newest",
+        "next_cursor": next_cursor,
+    }
+
+
+@app.post("/memory/v1/archive/search")
+async def memory_archive_search(request: Request):
+    """Search exact words inside the immutable original transcript archive."""
+    context = _memory_client_context(request)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="request body must be a JSON object")
+    attempted = sorted({"assistant_identity_id", "memory_space_id"}.intersection(payload))
+    if attempted:
+        raise HTTPException(
+            status_code=422,
+            detail=f"identity fields are assigned by the server: {', '.join(attempted)}",
+        )
+    query = _required_memory_text(payload, "query", 10000)
+    try:
+        limit = max(1, min(int(payload.get("limit", 50)), 200))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="limit must be an integer")
+    role = str(payload.get("role") or "").strip().lower() or None
+    if role not in {None, "user", "assistant", "system"}:
+        raise HTTPException(status_code=422, detail="role must be user, assistant, or system")
+    before_at, before_id = _decode_archive_cursor(str(payload.get("cursor") or ""))
+    conversation_filter = str(payload.get("conversation_id") or "").strip() or None
+    source_filter = str(payload.get("source_client") or "").strip() or None
+    if conversation_filter and len(conversation_filter) > 200:
+        raise HTTPException(status_code=422, detail="conversation_id exceeds 200 characters")
+    if source_filter and len(source_filter) > 200:
+        raise HTTPException(status_code=422, detail="source_client exceeds 200 characters")
+    rows = await search_memory_events(
+        query,
+        memory_space_id=context.memory_space_id,
+        limit=limit + 1,
+        before_at=before_at,
+        before_event_id=before_id,
+        conversation_id=conversation_filter,
+        source_client=source_filter,
+        role=role,
+    )
+    has_more = len(rows) > limit
+    visible = rows[:limit]
+    next_cursor = None
+    if has_more and visible:
+        next_cursor = _encode_archive_cursor(visible[-1]["occurred_at"], visible[-1]["event_id"])
+    return {"matches": visible, "next_cursor": next_cursor}
 
 
 @app.post("/memory/v1/memories/remember")
@@ -1912,6 +2120,16 @@ async def chat_completions(request: Request):
     # API_KEY」时才报 500。否则面板里配了供应商、但 env API_KEY 留空的用户会被误拦。
     body = await request.json()
     messages = body.get("messages", [])
+    archive_received_at = datetime.now(timezone.utc)
+    archive_idempotency_key = str(request.headers.get("idempotency-key") or "").strip()
+    archive_material = archive_idempotency_key or json.dumps(
+        messages, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    if bool(body.get("is_regenerate")) and not archive_idempotency_key:
+        # Regenerations intentionally create assistant variants; without a
+        # caller-provided idempotency key they are separate attempts.
+        archive_material += f"\x1fregenerate:{uuid.uuid4()}"
+    archive_request_key = hashlib.sha256(archive_material.encode("utf-8")).hexdigest()
     
     # ---------- 提取用户最新消息 ----------
     user_message = ""
@@ -2217,6 +2435,25 @@ async def chat_completions(request: Request):
             "",
         ) or ""
         session_id = "auto-" + hashlib.md5(first_user.encode("utf-8")).hexdigest()[:8]
+
+    archive_context = None
+    if not skip_prompt:
+        try:
+            archive_context = await _archive_gateway_user(
+                session_id=session_id,
+                request_key=archive_request_key,
+                user_message=user_message,
+                model=model,
+                project_id=project_id,
+                is_regenerate=is_regenerate,
+                occurred_at=archive_received_at,
+            )
+        except Exception as exc:
+            print(f"🚨 完整聊天归档失败（user）: {type(exc).__name__}: {exc}")
+            return JSONResponse(
+                status_code=503,
+                content={"error": "chat archive is enabled but the incoming message could not be stored"},
+            )
     
     # 请求 LLM 在流式响应中包含 token 用量
     if body.get("stream"):
@@ -2488,6 +2725,7 @@ async def chat_completions(request: Request):
                 is_regenerate=is_regenerate,
                 reasoning_effort=reasoning_effort,
                 skip_prompt=skip_prompt,
+                archive_context=archive_context,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
@@ -2496,7 +2734,7 @@ async def chat_completions(request: Request):
     # ========== 正常转发模式 ==========
     if is_stream:
         return StreamingResponse(
-            stream_and_capture(headers, body, session_id, user_message, model, tool_events, api_url=chat_api_url, project_id=project_id, prompt_meta=prompt_meta, api_format=api_format, api_key=chat_api_key, is_regenerate=is_regenerate, mem_enabled=mem_enabled),
+            stream_and_capture(headers, body, session_id, user_message, model, tool_events, api_url=chat_api_url, project_id=project_id, prompt_meta=prompt_meta, api_format=api_format, api_key=chat_api_key, is_regenerate=is_regenerate, mem_enabled=mem_enabled, archive_context=archive_context),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
         )
@@ -2523,6 +2761,12 @@ async def chat_completions(request: Request):
                     _spawn_background_task(
                         process_memories_background(session_id, user_message, assistant_msg, model, emotion_level=_emo, project_id=project_id, is_regenerate=is_regenerate)
                     )
+                if archive_context and assistant_msg:
+                    try:
+                        await _archive_gateway_assistant(archive_context, assistant_msg)
+                    except Exception as exc:
+                        print(f"🚨 完整聊天归档失败（assistant）: {type(exc).__name__}: {exc}")
+                        resp_data["kiwi_archive_warning"] = "assistant response was not archived"
                 
                 if dream_triggered:
                     print(f"🌙 检测到 Dream 标记，后台启动 Dream（非流式响应无 SSE 事件）...")
@@ -2719,7 +2963,7 @@ async def _execute_gateway_tool(tool_name: str, arguments: dict, tool_info: dict
     return f"未知的内置工具: {tool_name}", extra
 
 
-async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool_events, session_id, user_message, mem_enabled, api_url=None, api_key=None, project_id=None, prompt_meta=None, api_format="openai", is_regenerate: bool = False, reasoning_effort: str = None, skip_prompt: bool = False, top_p=None, max_tokens=None):
+async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool_events, session_id, user_message, mem_enabled, api_url=None, api_key=None, project_id=None, prompt_meta=None, api_format="openai", is_regenerate: bool = False, reasoning_effort: str = None, skip_prompt: bool = False, top_p=None, max_tokens=None, archive_context=None):
     """
     工具 + 流式模式：tool call 轮次用非流式（需要完整看 tool_calls），
     最终回复直接输出已获得的内容（模拟流式），不再重复请求 LLM。
@@ -2864,7 +3108,7 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
                     return
                 _emo = merge_emotion_levels(detect_emotion_from_user_msg(user_message), detect_emotion_from_response(assistant_msg))
                 mem_task = _spawn_background_task(
-                    _finalize_stream_memories(mem_enabled, session_id, user_message, assistant_msg, model, _emo, project_id, is_regenerate)
+                    _finalize_stream_memories(mem_enabled, session_id, user_message, assistant_msg, model, _emo, project_id, is_regenerate, archive_context)
                 )
 
             def _tool_spawn_dream():
@@ -3180,7 +3424,72 @@ async def _dream_fallback_after_grace(trigger_type: str = "auto", grace: float =
     _launch_dream_detached(trigger_type)
 
 
-async def _finalize_stream_memories(mem_enabled, session_id, user_message, assistant_msg, model, emotion_level, project_id, is_regenerate):
+def _gateway_archive_turn_id(session_id: str, request_key: str) -> str:
+    seed = f"{session_id}\x1f{request_key}".encode("utf-8")
+    return hashlib.sha256(seed).hexdigest()[:40]
+
+
+async def _archive_gateway_user(
+    *,
+    session_id: str,
+    request_key: str,
+    user_message: str,
+    model: str,
+    project_id: str = None,
+    is_regenerate: bool = False,
+    occurred_at: datetime = None,
+) -> dict | None:
+    """Persist the incoming visible user utterance before contacting the model."""
+    if not user_message or not await get_chat_archive_enabled():
+        return None
+    turn_id = _gateway_archive_turn_id(session_id, request_key)
+    # A regeneration belongs to the same transcript but does not repeat the
+    # already visible user utterance.  Its assistant variant is still appended.
+    if not is_regenerate:
+        await ingest_memory_event(
+            event_id=f"gateway:{turn_id}:user",
+            source_client="kiwi_gateway",
+            conversation_id=session_id,
+            role="user",
+            content=user_message,
+            occurred_at=occurred_at or datetime.now(timezone.utc),
+            metadata={"transport": "gateway", "model": model, "project_id": project_id},
+        )
+    return {
+        "turn_id": turn_id,
+        "conversation_id": session_id,
+        "model": model,
+        "project_id": project_id,
+        "is_regenerate": bool(is_regenerate),
+    }
+
+
+async def _archive_gateway_assistant(archive_context: dict | None, assistant_msg: str) -> dict | None:
+    """Append one visible assistant response; content hash keeps variants distinct."""
+    if not archive_context or not assistant_msg:
+        return None
+    clean_content = strip_dream_tag(strip_emotion_tag(assistant_msg))
+    if not clean_content:
+        return None
+    content_hash = hashlib.sha256(clean_content.encode("utf-8")).hexdigest()[:16]
+    result = await ingest_memory_event(
+        event_id=f"gateway:{archive_context['turn_id']}:assistant:{content_hash}",
+        source_client="kiwi_gateway",
+        conversation_id=archive_context["conversation_id"],
+        role="assistant",
+        content=clean_content,
+        occurred_at=datetime.now(timezone.utc),
+        metadata={
+            "transport": "gateway",
+            "model": archive_context.get("model"),
+            "project_id": archive_context.get("project_id"),
+            "is_regenerate": bool(archive_context.get("is_regenerate")),
+        },
+    )
+    return result
+
+
+async def _finalize_stream_memories(mem_enabled, session_id, user_message, assistant_msg, model, emotion_level, project_id, is_regenerate, archive_context=None):
     """流式收尾的记忆工作（消息入库 + 情绪权重 + 按周期提取）。
 
     独立成协程，供上层用 _spawn_background_task 提为独立后台 task：客户端断连时
@@ -3190,14 +3499,22 @@ async def _finalize_stream_memories(mem_enabled, session_id, user_message, assis
     mem_enabled 由调用方传入（转发路径内联 get_memory_enabled()，工具路径用其 mem_enabled 参数，
     后者已含 skip_prompt 覆盖），保持与各自原有判定完全一致。
     """
-    if not (mem_enabled and user_message and assistant_msg):
-        return None
-    return await process_memories_background(
-        session_id, user_message, assistant_msg, model,
-        emotion_level=emotion_level, project_id=project_id, is_regenerate=is_regenerate,
-    )
+    if archive_context and assistant_msg:
+        try:
+            await _archive_gateway_assistant(archive_context, assistant_msg)
+        except Exception as exc:
+            # The user utterance was already committed before the upstream call,
+            # so a failed assistant append is visible as an incomplete turn and
+            # can be replayed by the client instead of silently fabricating data.
+            print(f"🚨 完整聊天归档失败（assistant）: {type(exc).__name__}: {exc}")
+    if mem_enabled and user_message and assistant_msg:
+        return await process_memories_background(
+            session_id, user_message, assistant_msg, model,
+            emotion_level=emotion_level, project_id=project_id, is_regenerate=is_regenerate,
+        )
+    return None
 
-async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, tool_events: list = None, api_url: str = None, project_id: str = None, prompt_meta: dict = None, api_format: str = "openai", api_key: str = None, is_regenerate: bool = False, mem_enabled: bool = True):
+async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, tool_events: list = None, api_url: str = None, project_id: str = None, prompt_meta: dict = None, api_format: str = "openai", api_key: str = None, is_regenerate: bool = False, mem_enabled: bool = True, archive_context=None):
     """流式响应 + 捕获完整回复 + 工具事件"""
     _api_url = api_url or API_BASE_URL
 
@@ -3232,7 +3549,7 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
             return
         _emo = merge_emotion_levels(detect_emotion_from_user_msg(user_message), detect_emotion_from_response(_asmsg))
         mem_task = _spawn_background_task(
-            _finalize_stream_memories(mem_enabled, session_id, user_message, _asmsg, model, _emo, project_id, is_regenerate)
+            _finalize_stream_memories(mem_enabled, session_id, user_message, _asmsg, model, _emo, project_id, is_regenerate, archive_context)
         )
         finalize_spawned = True
 
@@ -5482,8 +5799,12 @@ async def api_sync_export():
             version_rows = await conn.fetch("""
                 SELECT * FROM memory_versions ORDER BY memory_id, version
             """)
+            event_rows = await conn.fetch("""
+                SELECT * FROM memory_events ORDER BY occurred_at, event_id
+            """)
         memories = [_serialize_datetimes(dict(r)) for r in mem_rows]
         memory_versions = [_serialize_datetimes(dict(r)) for r in version_rows]
+        memory_events = [_serialize_datetimes(dict(r)) for r in event_rows]
 
         # 配置
         all_config = await get_all_config()
@@ -5504,6 +5825,7 @@ async def api_sync_export():
             zf.writestr("projects.json", json.dumps(projs, ensure_ascii=False, indent=2))
             zf.writestr("memories.json", json.dumps(memories, ensure_ascii=False, indent=2))
             zf.writestr("memory_versions.json", json.dumps(memory_versions, ensure_ascii=False, indent=2))
+            zf.writestr("memory_events.json", json.dumps(memory_events, ensure_ascii=False, indent=2))
             zf.writestr("config.json", json.dumps(config_flat, ensure_ascii=False, indent=2))
             zf.writestr("settings.json", json.dumps(settings, ensure_ascii=False, indent=2))
         buf.seek(0)
@@ -5563,7 +5885,7 @@ async def api_sync_import_backup(file: UploadFile = File(...)):
             return JSONResponse(status_code=400, content={"error": "不是有效的 zip 文件"})
 
         buf.seek(0)
-        result = {"conversations": 0, "messages": 0, "projects": 0, "memories": 0, "memory_versions": 0, "settings": 0, "config": 0}
+        result = {"conversations": 0, "messages": 0, "projects": 0, "memories": 0, "memory_versions": 0, "memory_events": 0, "settings": 0, "config": 0}
 
         with zipfile.ZipFile(buf, 'r') as zf:
             names = zf.namelist()
@@ -5665,6 +5987,25 @@ async def api_sync_import_backup(file: UploadFile = File(...)):
                              version.get("change_type", "original"),
                              _parse_backup_datetime(version.get("created_at")))
                         result["memory_versions"] += 1
+
+            # 完整对话原文是 append-only 证据：备份恢复只做幂等插入，
+            # 同 event_id 的不同内容会触发冲突，不得覆盖旧原文。
+            if "memory_events.json" in names:
+                archived_events = json.loads(zf.read("memory_events.json"))
+                for event in archived_events:
+                    restored = await ingest_memory_event(
+                        event_id=str(event.get("event_id") or ""),
+                        source_client=str(event.get("source_client") or "backup_import"),
+                        conversation_id=str(event.get("conversation_id") or ""),
+                        role=str(event.get("role") or ""),
+                        content=str(event.get("content") or ""),
+                        occurred_at=_parse_backup_datetime(event.get("occurred_at")) or datetime.now(timezone.utc),
+                        metadata=event.get("metadata") if isinstance(event.get("metadata"), dict) else {},
+                        memory_space_id=str(event.get("memory_space_id") or "zhizhi_grey"),
+                        assistant_identity_id=str(event.get("assistant_identity_id") or "grey_knox"),
+                    )
+                    if restored.get("created"):
+                        result["memory_events"] += 1
 
             # 导入同步设置
             if "settings.json" in names:

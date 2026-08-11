@@ -177,7 +177,7 @@ nano .env
 API_KEY=
 ```
 
-> 🔐 `/memory/v1/*` 共享身份记忆 API 使用独立 Bearer 密钥鉴权。旧版聊天网关、管理面板和调试/同步端点仍没有内建鉴权；请只在私网或 Tailscale 内开放，或使用 Cloudflare Access、反向代理鉴权、IP 白名单保护整个服务。尤其要保护 `/admin`、`/sync/export` 和 `/sync/import-backup`，这些旧端点没有内建鉴权。
+> 🔐 `/memory/v1/*` 共享身份记忆 API 使用独立 Bearer 密钥鉴权。旧版聊天网关、管理面板和调试/同步端点仍没有内建鉴权；请只在私网或 Tailscale 内开放，或使用 Cloudflare Access、反向代理鉴权、IP 白名单保护整个服务。尤其要保护 `/admin`、`/sync/export` 和 `/sync/import-backup`，这些旧端点没有内建鉴权。开启完整聊天归档后，服务会保存逐字对话，不应直接暴露在公网。Docker Compose 默认只绑定 `127.0.0.1`；需跨机访问时将 `KIWI_BIND_IP` 设为私网/Tailscale IP。
 
 保存后启动：
 ```bash
@@ -406,6 +406,8 @@ https://你的域名/admin
 |---|---|---|
 | `DATABASE_URL` | PostgreSQL 连接串（Docker Compose 自动配置） | — |
 | `MEMORY_ENABLED` | 记忆系统开关 | `true` |
+| `CHAT_ARCHIVE_ENABLED` | 自动保存网关双方可见原文（高敏感，显式开启） | `false` |
+| `KIWI_BIND_IP` | Docker 宿主机绑定地址 | `127.0.0.1` |
 | `MEMORY_ASSISTANT_ID` | 所有记忆入口共享的助手身份 ID | `grey_knox` |
 | `MEMORY_SPACE_ID` | 所有记忆入口共享的空间 ID | `zhizhi_grey` |
 | `MEMORY_CLIENT_KEYS_JSON` | 入口名到 Bearer 密钥的 JSON 映射 | — |
@@ -457,6 +459,10 @@ https://你的域名/admin
 |---|---|---|
 | `/memory/v1/whoami` | GET | 验证入口并返回统一身份（需 Bearer 密钥） |
 | `/memory/v1/events/ingest` | POST | 幂等写入原始对话事件（需 Bearer 密钥） |
+| `/memory/v1/events/ingest-batch` | POST | 断线后原子化补传最多 500 条原文（需 Bearer 密钥） |
+| `/memory/v1/archive/conversations` | GET | 分页查看归档会话目录（需 Bearer 密钥） |
+| `/memory/v1/archive/conversations/{id}` | GET | 分页阅读一段不可变原文对话（需 Bearer 密钥） |
+| `/memory/v1/archive/search` | POST | 在完整对话原文中搜索（需 Bearer 密钥） |
 | `/memory/v1/memories/remember` | POST | 主动写入第一人称语义记忆（需 Bearer 密钥） |
 | `/memory/v1/recall` | POST | 从统一记忆空间召回（需 Bearer 密钥） |
 | `/memory/v1/handoff` | POST | 跨入口/换窗接续最近对话（需 Bearer 密钥） |

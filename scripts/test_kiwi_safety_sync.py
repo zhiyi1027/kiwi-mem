@@ -1354,6 +1354,241 @@ async def test_shared_identity_api(client: httpx.AsyncClient) -> None:
     passed("T-ID-5 voice guard rejects split/third-person selves while allowing the name itself")
 
 
+async def test_complete_chat_archive(client: httpx.AsyncClient) -> None:
+    print("\nP1 complete transcript archive: replay, paging, search, and gateway capture")
+
+    await _truncate("memory_events")
+    keys = {
+        "codex": "test-codex-key-0000000000000001",
+        "cc1": "test-cc-one-key-000000000000002",
+        "cc2": "test-cc-two-key-000000000000003",
+    }
+
+    def auth(key: str = "codex") -> dict[str, str]:
+        return {"Authorization": f"Bearer {keys[key]}"}
+
+    unauthenticated = await client.get("/memory/v1/archive/conversations")
+    require(unauthenticated.status_code == 401, "transcript archive can be read without a bearer key")
+
+    events = [
+        {
+            "event_id": "archive-a-1",
+            "conversation_id": "archive-a",
+            "role": "user",
+            "content": "  知知说第一段共同暗号。  ",
+            "occurred_at": "2026-08-11T01:00:00Z",
+        },
+        {
+            "event_id": "archive-a-2",
+            "conversation_id": "archive-a",
+            "role": "assistant",
+            "content": "我记住了第一段共同暗号。",
+            "occurred_at": "2026-08-11T01:01:00Z",
+        },
+        {
+            "event_id": "archive-a-3",
+            "conversation_id": "archive-a",
+            "role": "system",
+            "content": "archive-a internal marker",
+            "occurred_at": "2026-08-11T01:02:00Z",
+        },
+        {
+            "event_id": "archive-b-1",
+            "conversation_id": "archive-b",
+            "role": "user",
+            "content": "知知说第二段共同暗号。",
+            "occurred_at": "2026-08-11T02:00:00Z",
+        },
+        {
+            "event_id": "archive-b-2",
+            "conversation_id": "archive-b",
+            "role": "assistant",
+            "content": "我回应了第二段共同暗号。",
+            "occurred_at": "2026-08-11T02:01:00Z",
+        },
+        {
+            "event_id": "archive-c-1",
+            "conversation_id": "archive-c",
+            "role": "user",
+            "content": "百分号只是普通字符，不是查询通配符。",
+            "occurred_at": "2026-08-11T03:00:00Z",
+        },
+    ]
+    first = await client.post(
+        "/memory/v1/events/ingest-batch", headers=auth("codex"), json={"events": events}
+    )
+    retry = await client.post(
+        "/memory/v1/events/ingest-batch", headers=auth("cc1"), json={"events": events}
+    )
+    require(first.status_code == 200 and first.json()["created"] == len(events), first.text)
+    require(retry.status_code == 200 and retry.json()["duplicates"] == len(events), retry.text)
+    require(await _pool_fetchval("SELECT COUNT(*) FROM memory_events") == len(events), "batch replay duplicated raw evidence")
+    await database.ingest_memory_event(
+        event_id="other-space-event",
+        source_client="test-only",
+        conversation_id="other-space-conversation",
+        role="user",
+        content="另一个记忆空间的原文。",
+        occurred_at=StdDateTime(2026, 8, 11, 6, 0, tzinfo=timezone.utc),
+        memory_space_id="other-space",
+        assistant_identity_id="other-self",
+    )
+
+    conflict = await client.post(
+        "/memory/v1/events/ingest",
+        headers=auth("cc2"),
+        json={**events[0], "content": "同一个编号下的另一段话"},
+    )
+    require(conflict.status_code == 409, f"event id collision was silently accepted: {conflict.text}")
+    require(
+        await _pool_fetchval("SELECT content FROM memory_events WHERE event_id='archive-a-1'") == events[0]["content"],
+        "event collision overwrote immutable evidence",
+    )
+
+    atomic = await client.post(
+        "/memory/v1/events/ingest-batch",
+        headers=auth("codex"),
+        json={
+            "events": [
+                {
+                    "event_id": "archive-new-before-conflict",
+                    "conversation_id": "archive-d",
+                    "role": "user",
+                    "content": "这条必须随整批回滚。",
+                    "occurred_at": "2026-08-11T04:00:00Z",
+                },
+                {**events[1], "content": "冲突内容"},
+            ]
+        },
+    )
+    require(atomic.status_code == 409, f"conflicting replay batch succeeded: {atomic.text}")
+    require(
+        await _pool_fetchval("SELECT COUNT(*) FROM memory_events WHERE event_id='archive-new-before-conflict'") == 0,
+        "batch replay was partially committed before a conflict",
+    )
+    passed("T-ARCH-1 replay is idempotent, collision-safe, and transaction-atomic")
+
+    page1 = await client.get("/memory/v1/archive/conversations?limit=2", headers=auth("cc1"))
+    require(page1.status_code == 200, page1.text)
+    page1_body = page1.json()
+    require([item["conversation_id"] for item in page1_body["conversations"]] == ["archive-c", "archive-b"], page1.text)
+    require(page1_body["next_cursor"], "conversation list omitted its next cursor")
+    page2 = await client.get(
+        "/memory/v1/archive/conversations",
+        headers=auth("cc1"),
+        params={"limit": 2, "cursor": page1_body["next_cursor"]},
+    )
+    require([item["conversation_id"] for item in page2.json()["conversations"]] == ["archive-a"], page2.text)
+
+    transcript1 = await client.get("/memory/v1/archive/conversations/archive-a?limit=1", headers=auth("cc2"))
+    transcript1_body = transcript1.json()
+    require(transcript1.status_code == 200 and transcript1_body["next_cursor"], transcript1.text)
+    transcript2 = await client.get(
+        "/memory/v1/archive/conversations/archive-a",
+        headers=auth("cc2"),
+        params={"limit": 5, "cursor": transcript1_body["next_cursor"]},
+    )
+    visible_ids = [item["event_id"] for item in transcript1_body["events"] + transcript2.json()["events"]]
+    require(set(visible_ids) == {"archive-a-1", "archive-a-2"}, f"transcript paging lost/duplicated visible dialogue: {visible_ids}")
+    with_system = await client.get(
+        "/memory/v1/archive/conversations/archive-a?limit=10&include_system=true", headers=auth("cc2")
+    )
+    require(
+        {item["event_id"] for item in with_system.json()["events"]}
+        == {"archive-a-1", "archive-a-2", "archive-a-3"},
+        "explicit system-event view did not return the complete stored transcript",
+    )
+    passed("T-ARCH-2 conversation directory and immutable transcript pages use stable cursors")
+
+    search = await client.post(
+        "/memory/v1/archive/search",
+        headers=auth("codex"),
+        json={"query": "共同暗号", "role": "assistant", "limit": 1},
+    )
+    require(search.status_code == 200 and len(search.json()["matches"]) == 1, search.text)
+    require(search.json()["next_cursor"], "archive search omitted pagination cursor")
+    search2 = await client.post(
+        "/memory/v1/archive/search",
+        headers=auth("codex"),
+        json={"query": "共同暗号", "role": "assistant", "limit": 1, "cursor": search.json()["next_cursor"]},
+    )
+    assistant_matches = search.json()["matches"] + search2.json()["matches"]
+    require(
+        {item["event_id"] for item in assistant_matches} == {"archive-a-2", "archive-b-2"},
+        f"archive search paging/filter drifted: {assistant_matches}",
+    )
+    literal_wildcard = await client.post(
+        "/memory/v1/archive/search", headers=auth("codex"), json={"query": "%"}
+    )
+    require(literal_wildcard.json()["matches"] == [], "archive search treated % as a wildcard")
+    passed("T-ARCH-3 literal full-text search is authenticated, filtered, and cursor-paged")
+
+    await _truncate("memory_events")
+    await _upsert_config("chat_archive_enabled", "true")
+    archive_context = await app_module._archive_gateway_user(
+        session_id="gateway-conversation",
+        request_key="stable-request-key",
+        user_message="知知从网关发来的原话。",
+        model="test-model",
+        occurred_at=StdDateTime(2026, 8, 11, 5, 0, tzinfo=timezone.utc),
+    )
+    duplicate_context = await app_module._archive_gateway_user(
+        session_id="gateway-conversation",
+        request_key="stable-request-key",
+        user_message="知知从网关发来的原话。",
+        model="test-model",
+        occurred_at=StdDateTime(2026, 8, 11, 5, 0, tzinfo=timezone.utc),
+    )
+    await app_module._finalize_stream_memories(
+        False,
+        "gateway-conversation",
+        "知知从网关发来的原话。",
+        "我从网关回复的原话。<!--emotion:高--><!--dream:trigger-->",
+        "test-model",
+        "high",
+        None,
+        False,
+        archive_context,
+    )
+    gateway_rows = await _pool_fetch(
+        "SELECT role, content, source_client FROM memory_events ORDER BY occurred_at, event_id"
+    )
+    require(archive_context == duplicate_context and len(gateway_rows) == 2, f"gateway capture was not idempotent: {gateway_rows}")
+    require(
+        [row["content"] for row in gateway_rows]
+        == ["知知从网关发来的原话。", "我从网关回复的原话。"],
+        f"gateway archive stored hidden control tags or lost visible prose: {[dict(row) for row in gateway_rows]}",
+    )
+    require(all(row["source_client"] == "kiwi_gateway" for row in gateway_rows), "gateway audit source drifted")
+
+    backup = await client.get("/sync/export")
+    require(backup.status_code == 200, f"archive backup export failed: {backup.text}")
+    with zipfile.ZipFile(io.BytesIO(backup.content)) as exported_zip:
+        require("memory_events.json" in exported_zip.namelist(), "backup omitted complete transcript evidence")
+        exported_events = json.loads(exported_zip.read("memory_events.json"))
+    require(len(exported_events) == 2, f"backup exported wrong transcript count: {exported_events}")
+
+    restore_buffer = io.BytesIO()
+    with zipfile.ZipFile(restore_buffer, "w", zipfile.ZIP_DEFLATED) as restore_zip:
+        restore_zip.writestr("memory_events.json", json.dumps(exported_events, ensure_ascii=False))
+    await _truncate("memory_events")
+    restored = await client.post(
+        "/sync/import-backup",
+        files={"file": ("archive-only.zip", restore_buffer.getvalue(), "application/zip")},
+    )
+    require(restored.status_code == 200 and restored.json()["memory_events"] == 2, restored.text)
+    require(
+        await _pool_fetchval("SELECT COUNT(*) FROM memory_events") == 2,
+        "backup restore lost immutable transcript events",
+    )
+    await _upsert_config("chat_archive_enabled", "false")
+    disabled = await app_module._archive_gateway_user(
+        session_id="disabled", request_key="disabled", user_message="不应自动归档", model="test-model"
+    )
+    require(disabled is None, "disabled gateway archive still captured messages")
+    passed("T-ARCH-4 gateway capture and backup preserve visible prose independently of semantic extraction")
+
+
 async def test_autobiographical_pipelines() -> None:
     print("\nP0 autobiographical pipelines: session isolation and Dream fail-closed")
 
@@ -1710,6 +1945,7 @@ async def run_suite(test_dsn: str) -> None:
         await test_w1_01()
         await test_continuity_profile(client)
         await test_shared_identity_api(client)
+        await test_complete_chat_archive(client)
         await test_autobiographical_pipelines()
 
 
@@ -1733,11 +1969,13 @@ async def async_main() -> int:
         continuity_passed = [name for name in PASSED if name.startswith("T-CONT-")]
         identity_passed = [name for name in PASSED if name.startswith("T-ID-")]
         p0_identity_passed = [name for name in PASSED if name.startswith("T-P0-ID-")]
+        archive_passed = [name for name in PASSED if name.startswith("T-ARCH-")]
         print(f"\nPASS: {len(legacy_passed)} permanent S1-S6 behavior guards")
         print(f"PASS: {len(w1_01_passed)} W1-01 isolation/permanent guards")
         print(f"PASS: {len(continuity_passed)} continuity/no-forgetting guards")
         print(f"PASS: {len(identity_passed)} shared-identity API guards")
         print(f"PASS: {len(p0_identity_passed)} autobiographical pipeline guards")
+        print(f"PASS: {len(archive_passed)} complete transcript archive guards")
         print(f"PASS: {len(PASSED)} total permanent behavior guards")
         print("Real database path: disposable PostgreSQL verified")
         print("Real model/API path: not called; embedding/model/HTTP boundaries were mocked")
