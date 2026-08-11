@@ -4,7 +4,7 @@ name: CI
 # 绿勾 = 所有 .py 文件语法没问题；红叉 = 哪里写坏了，服务可能起不来。
 on:
   push:
-    branches: [main]
+    branches: [main, 'codex/**']
   pull_request:
 
 jobs:
