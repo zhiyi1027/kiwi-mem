@@ -138,7 +138,7 @@ Visit `http://localhost:8080` — if you see `{"status":"running"}`, you're good
 - Point your chat client's API endpoint to `http://localhost:8080/v1`
 - Works with any OpenAI-format frontend: ChatBox, NextChat, SillyTavern, or your own
 
-> 🔐 The shared-identity `/memory/v1/*` API uses per-door Bearer credentials. Admin, debug, Dream, calendar, and sync routes use a separate admin Bearer secret; the server stores SHA-256 digests only. The legacy chat gateway and MCP transport are still not public-Internet authentication boundaries, so keep the whole service on a private network/Tailscale or behind a strict reverse-proxy route allowlist. Once complete transcript archiving is enabled, do not expose the service directly to the public Internet. Docker Compose binds to `127.0.0.1` by default; set `KIWI_BIND_IP` to a private/Tailscale address for cross-host access.
+> 🔐 The shared-identity `/memory/v1/*` API uses per-door Bearer credentials. Admin, debug, Dream, calendar, and sync routes use a separate admin Bearer secret; the server stores SHA-256 digests only. The legacy chat gateway and MCP transport are still not public-Internet authentication boundaries, so keep the entire service on a private network/Tailscale or behind a strict reverse-proxy route allowlist. Once complete transcript archiving is enabled, do not expose the service directly to the public Internet. Docker Compose binds to `127.0.0.1` by default; set `KIWI_BIND_IP` to a private/Tailscale address for cross-host access.
 
 > 💡 80+ parameters can be changed at runtime via the admin panel — no restart needed.
 
