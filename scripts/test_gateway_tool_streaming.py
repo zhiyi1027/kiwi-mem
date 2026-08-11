@@ -9,6 +9,7 @@ import ast
 import asyncio
 import contextvars
 import copy
+import hashlib
 import json
 import os
 import sys
@@ -22,6 +23,12 @@ sys.path.insert(0, ROOT)
 import httpx
 
 import config as config_module
+
+GATEWAY_CLIENT_SECRET = "test-gateway-client-secret"
+os.environ["MEMORY_CLIENT_KEY_DIGESTS_JSON"] = json.dumps({
+    "gateway_test": hashlib.sha256(GATEWAY_CLIENT_SECRET.encode("utf-8")).hexdigest()
+})
+
 import main as gateway
 import tool_drawer as td
 
@@ -251,6 +258,7 @@ async def post_gateway(client, key, session_id, config, *, mcp_servers=None):
         response = await client.post(
             "/v1/chat/completions",
             json=gateway_request(key, session_id, mcp_servers=mcp_servers),
+            headers={"Authorization": f"Bearer {GATEWAY_CLIENT_SECRET}"},
         )
     finally:
         REQUEST_CONFIG.reset(token)

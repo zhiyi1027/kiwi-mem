@@ -75,6 +75,7 @@ from access_control import (
     authenticate_internal_control,
     bearer_token,
     is_control_plane_path,
+    is_shared_identity_entry_path,
 )
 
 # ============================================================
@@ -336,8 +337,31 @@ app.add_middleware(
 
 @app.middleware("http")
 async def require_control_plane_auth(request: Request, call_next):
-    """Fail closed on every data-bearing or writable management route."""
-    if not is_control_plane_path(request.url.path):
+    """Fail closed on operator routes and every externally callable transport."""
+    path = request.url.path
+
+    if is_shared_identity_entry_path(path):
+        # Browser CORS preflights contain no credentials or application data;
+        # the subsequent request still has to authenticate.
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        try:
+            context = authenticate_memory_client(bearer_token(request.headers.get("authorization", "")))
+        except MemoryClientConfigError as exc:
+            return JSONResponse(status_code=503, content={"detail": str(exc)})
+        if context is None:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "memory client bearer token required"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        # The mounted transports currently share one canonical memory space.
+        # Keeping the context on request.state avoids ever reflecting the door
+        # name in response payloads while leaving room for future scoped tools.
+        request.state.memory_client_context = context
+        return await call_next(request)
+
+    if not is_control_plane_path(path):
         return await call_next(request)
 
     internal_token = request.headers.get("x-kiwi-internal-control", "")
@@ -409,7 +433,6 @@ _PUBLIC_ARCHIVE_CONVERSATION_FIELDS = (
     "preview",
 )
 _PUBLIC_ARCHIVE_EVENT_FIELDS = (
-    "event_id",
     "conversation_id",
     "role",
     "content",

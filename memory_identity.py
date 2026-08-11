@@ -104,20 +104,28 @@ _OBSERVER_SELF_PATTERN = re.compile(
     r"(?:AI(?:助手)?|助手|Assistant)\s*(?:(?:认为|觉得|答应|承诺|发现|意识到|担心|希望|爱|记得|注意到|决定|知道|理解|会|要)|(?:的(?:话|日记|感言|回应|承诺|想法)))",
     re.IGNORECASE,
 )
-_USER_REFERENCE_PATTERNS = (
-    re.compile(r"该用户|用户本人"),
-    re.compile(r"用户(?=\s*[:：])"),
-    re.compile(
-        r"用户(?=\s*(?:说|表示|提到|认为|觉得|喜欢|不喜欢|讨厌|希望|想要|需要|担心|"
-        r"害怕|计划|决定|正在|曾经|已经|仍然|一直|会|不会|可以|不能|不愿|愿意|"
-        r"出生|居住|工作|学习|从事|拥有|选择|要求|询问|回答|告诉|分享|同意|拒绝))"
-    ),
-    re.compile(
-        r"用户(?=的(?!名(?:字|称)?|体验|界面|端|侧|态|数据|输入|请求|权限|账户|账号|"
-        r"系统|设备|客户端|配置|令牌|密钥|API|ID))"
-    ),
-    re.compile(r"(?m)^(?P<prefix>\s*(?:[-*+]\s*)?)用户(?=\s*(?:偏好|喜好|习惯|近况|档案|基本信息|健康|关系|经历|感受|承诺|计划|画像))"),
+# Generated autobiographical prose may legitimately mention technical concepts
+# such as “用户名” or “多用户系统”.  Protect those complete terms, then treat
+# every other occurrence of 用户 as an observer label for 知知.  This is safer
+# than maintaining an inevitably incomplete list of verbs after “用户”.
+_TECHNICAL_USER_TERM_PATTERN = re.compile(
+    r"(?:多用户|单用户|最终用户|终端用户|测试用户|管理员用户|普通用户|企业用户|匿名用户|"
+    r"用户(?:名(?:字|称)?|体验|界面|端|侧|态|数据|输入|请求|权限|账户|账号|系统|设备|"
+    r"客户端|配置|令牌|密钥|API|ID|标识|认证|授权|登录|注册|会话|角色|组|模型|行为|"
+    r"反馈|需求|流程|协议|文档|设置|目录|表|字段|记录|服务|管理|中心))",
+    re.IGNORECASE,
 )
+_OBSERVER_USER_LABEL_PATTERN = re.compile(r"该用户|用户本人|用户")
+
+
+def _nontechnical_user_segments(text: str):
+    """Yield spans that are not allow-listed technical 用户 terminology."""
+    value = str(text or "")
+    cursor = 0
+    for match in _TECHNICAL_USER_TERM_PATTERN.finditer(value):
+        yield value[cursor:match.start()]
+        cursor = match.end()
+    yield value[cursor:]
 
 
 def append_identity_contract(prompt: str, *, profile: bool = False) -> str:
@@ -128,15 +136,45 @@ def append_identity_contract(prompt: str, *, profile: bool = False) -> str:
 
 
 def normalize_generated_subjects(text: str) -> str:
-    """Normalize observer labels without corrupting legitimate technical words."""
+    """Normalize every nontechnical observer label without altering raw chat."""
     value = str(text or "").strip()
-    for pattern in _USER_REFERENCE_PATTERNS:
-        value = pattern.sub(lambda match: f"{match.groupdict().get('prefix', '')}知知", value)
-    return value
+    pieces: list[str] = []
+    cursor = 0
+    for match in _TECHNICAL_USER_TERM_PATTERN.finditer(value):
+        observer_prose = value[cursor:match.start()]
+        pieces.append(_OBSERVER_USER_LABEL_PATTERN.sub("知知", observer_prose))
+        pieces.append(match.group(0))
+        cursor = match.end()
+    pieces.append(_OBSERVER_USER_LABEL_PATTERN.sub("知知", value[cursor:]))
+    return "".join(pieces)
 
 
 def contains_observer_user_label(text: str) -> bool:
-    return any(pattern.search(str(text or "")) for pattern in _USER_REFERENCE_PATTERNS)
+    return any("用户" in segment for segment in _nontechnical_user_segments(text))
+
+
+_OPAQUE_ARCHIVE_PATTERNS = {
+    "conversation": re.compile(r"conv_[0-9a-f]{64}"),
+    "event": re.compile(r"evt_[0-9a-f]{64}"),
+}
+
+
+def opaque_archive_identifier(value: str, kind: str) -> str:
+    """Map caller-controlled archive IDs to stable, identity-neutral IDs.
+
+    Raw identifiers remain useful to callers for idempotency and conversation
+    grouping, but they may contain room or machine names.  Only this stable
+    digest is stored and returned.  Recognising an already opaque identifier
+    keeps backup restore idempotent.
+    """
+    clean = str(value or "").strip()
+    if kind not in _OPAQUE_ARCHIVE_PATTERNS:
+        raise ValueError("archive identifier kind must be conversation or event")
+    if _OPAQUE_ARCHIVE_PATTERNS[kind].fullmatch(clean):
+        return clean
+    prefix = "conv" if kind == "conversation" else "evt"
+    material = f"kiwi-archive-{kind}-v1\x00{clean}".encode("utf-8")
+    return f"{prefix}_{hashlib.sha256(material).hexdigest()}"
 
 
 def infer_memory_kind(content: str) -> str:

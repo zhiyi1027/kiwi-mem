@@ -30,7 +30,7 @@ import httpx
 import jieba
 import jieba.analyse
 
-from memory_identity import prepare_generated_memory, prepare_scene_fields
+from memory_identity import opaque_archive_identifier, prepare_generated_memory, prepare_scene_fields
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 CANONICAL_ASSISTANT_ID = os.getenv("MEMORY_ASSISTANT_ID", "grey_knox").strip() or "grey_knox"
@@ -1276,6 +1276,11 @@ async def _ingest_memory_event_conn(
     assistant_identity_id: str,
 ) -> dict:
     """Insert one immutable event using an existing connection/transaction."""
+    # Client IDs are idempotency/grouping inputs, not public identity labels.
+    # Store only stable opaque forms so no room, account, or machine name can
+    # surface through archive listings, cursors, handoff, or backups.
+    event_id = opaque_archive_identifier(event_id, "event")
+    conversation_id = opaque_archive_identifier(conversation_id, "conversation")
     row = await conn.fetchrow("""
             INSERT INTO memory_events (
                 event_id, memory_space_id, assistant_identity_id, source_client,
@@ -1459,6 +1464,8 @@ async def get_memory_handoff(
 ) -> dict | None:
     """Return the latest prior conversation tail from the shared event log."""
     safe_tail = max(1, min(int(tail_count or 6), 50))
+    if current_conversation_id:
+        current_conversation_id = opaque_archive_identifier(current_conversation_id, "conversation")
     pool = await get_pool()
     async with pool.acquire() as conn:
         source = await conn.fetchrow("""

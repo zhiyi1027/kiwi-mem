@@ -28,7 +28,6 @@ from access_control import internal_control_headers
 
 GATEWAY_PORT = int(os.getenv("PORT", "8080"))
 GATEWAY_BASE = f"http://127.0.0.1:{GATEWAY_PORT}"
-MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "")
 
 # MCP 与网关同进程运行。内部回环请求使用进程启动时随机生成的能力值，
 # 不需要、也不会读取管理员的原始密钥。

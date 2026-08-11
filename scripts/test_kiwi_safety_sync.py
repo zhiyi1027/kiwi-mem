@@ -1207,6 +1207,8 @@ async def test_continuity_profile(client: httpx.AsyncClient) -> None:
 async def test_shared_identity_api(client: httpx.AsyncClient) -> None:
     print("\nShared identity API: three doors, one autobiographical memory")
 
+    from memory_identity import opaque_archive_identifier
+
     await _truncate("memory_events", "memories")
     keys = {
         "codex_vps2": "test-codex-key-0000000000000001",
@@ -1251,7 +1253,7 @@ async def test_shared_identity_api(client: httpx.AsyncClient) -> None:
     require("source_client" not in first.text and "source_client" not in duplicate.text, "ingest leaked door metadata")
     event_row = await _pool_fetchrow(
         "SELECT source_client, assistant_identity_id, memory_space_id FROM memory_events WHERE event_id=$1",
-        event["event_id"],
+        opaque_archive_identifier(event["event_id"], "event"),
     )
     require(
         tuple(event_row) == ("codex_vps2", "grey_knox", "zhizhi_grey"),
@@ -1366,12 +1368,25 @@ async def test_control_plane_auth(client: httpx.AsyncClient) -> None:
         shell = await unauthenticated.get("/admin")
         export = await unauthenticated.get("/sync/export")
         config_response = await unauthenticated.get("/admin/config")
+        chat_response = await unauthenticated.get("/v1/chat/completions")
+        memory_mcp = await unauthenticated.post("/memory/mcp")
+        calendar_mcp = await unauthenticated.post("/calendar/mcp")
         bad_verify = await unauthenticated.post(
             "/auth/verify", headers={"Authorization": "Bearer wrong-admin-secret"}
         )
+        valid_door = await unauthenticated.get(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-codex-key-0000000000000001"},
+        )
     require(shell.status_code == 200, "public admin shell is unavailable before login")
     require(export.status_code == 401 and config_response.status_code == 401, "control-plane data is readable without admin auth")
+    require(
+        chat_response.status_code == memory_mcp.status_code == calendar_mcp.status_code == 401,
+        "chat or MCP transport is reachable without a memory-client key",
+    )
     require(bad_verify.status_code == 401, "invalid admin secret passed verification")
+
+    require(valid_door.status_code == 405, "valid memory-client key did not reach the chat route")
 
     verified = await client.post("/auth/verify")
     protected = await client.get("/admin/config")
@@ -1392,6 +1407,8 @@ async def test_control_plane_auth(client: httpx.AsyncClient) -> None:
 
 async def test_complete_chat_archive(client: httpx.AsyncClient) -> None:
     print("\nP1 complete transcript archive: replay, paging, search, and gateway capture")
+
+    from memory_identity import opaque_archive_identifier
 
     await _truncate("memory_events")
     keys = {
@@ -1458,6 +1475,10 @@ async def test_complete_chat_archive(client: httpx.AsyncClient) -> None:
     )
     require(first.status_code == 200 and first.json()["created"] == len(events), first.text)
     require(retry.status_code == 200 and retry.json()["duplicates"] == len(events), retry.text)
+    require(
+        all(re.fullmatch(r"evt_[0-9a-f]{64}", item) for item in first.json()["event_ids"]),
+        f"ingest response exposed caller event labels: {first.text}",
+    )
     require(await _pool_fetchval("SELECT COUNT(*) FROM memory_events") == len(events), "batch replay duplicated raw evidence")
     await database.ingest_memory_event(
         event_id="other-space-event",
@@ -1477,7 +1498,10 @@ async def test_complete_chat_archive(client: httpx.AsyncClient) -> None:
     )
     require(conflict.status_code == 409, f"event id collision was silently accepted: {conflict.text}")
     require(
-        await _pool_fetchval("SELECT content FROM memory_events WHERE event_id='archive-a-1'") == events[0]["content"],
+        await _pool_fetchval(
+            "SELECT content FROM memory_events WHERE event_id=$1",
+            opaque_archive_identifier("archive-a-1", "event"),
+        ) == events[0]["content"],
         "event collision overwrote immutable evidence",
     )
 
@@ -1499,7 +1523,10 @@ async def test_complete_chat_archive(client: httpx.AsyncClient) -> None:
     )
     require(atomic.status_code == 409, f"conflicting replay batch succeeded: {atomic.text}")
     require(
-        await _pool_fetchval("SELECT COUNT(*) FROM memory_events WHERE event_id='archive-new-before-conflict'") == 0,
+        await _pool_fetchval(
+            "SELECT COUNT(*) FROM memory_events WHERE event_id=$1",
+            opaque_archive_identifier("archive-new-before-conflict", "event"),
+        ) == 0,
         "batch replay was partially committed before a conflict",
     )
     passed("T-ARCH-1 replay is idempotent, collision-safe, and transaction-atomic")
@@ -1508,32 +1535,40 @@ async def test_complete_chat_archive(client: httpx.AsyncClient) -> None:
     require(page1.status_code == 200, page1.text)
     require("source_client" not in page1.text and '"metadata"' not in page1.text, "conversation list leaked entry metadata")
     page1_body = page1.json()
-    require([item["conversation_id"] for item in page1_body["conversations"]] == ["archive-c", "archive-b"], page1.text)
+    conv_a = opaque_archive_identifier("archive-a", "conversation")
+    conv_b = opaque_archive_identifier("archive-b", "conversation")
+    conv_c = opaque_archive_identifier("archive-c", "conversation")
+    require([item["conversation_id"] for item in page1_body["conversations"]] == [conv_c, conv_b], page1.text)
+    require("archive-" not in page1.text, f"conversation directory exposed caller room labels: {page1.text}")
     require(page1_body["next_cursor"], "conversation list omitted its next cursor")
     page2 = await client.get(
         "/memory/v1/archive/conversations",
         headers=auth("cc1"),
         params={"limit": 2, "cursor": page1_body["next_cursor"]},
     )
-    require([item["conversation_id"] for item in page2.json()["conversations"]] == ["archive-a"], page2.text)
+    require([item["conversation_id"] for item in page2.json()["conversations"]] == [conv_a], page2.text)
 
-    transcript1 = await client.get("/memory/v1/archive/conversations/archive-a?limit=1", headers=auth("cc2"))
+    transcript1 = await client.get(f"/memory/v1/archive/conversations/{conv_a}?limit=1", headers=auth("cc2"))
     transcript1_body = transcript1.json()
     require(transcript1.status_code == 200 and transcript1_body["next_cursor"], transcript1.text)
     require("source_client" not in transcript1.text and '"metadata"' not in transcript1.text, "transcript page leaked entry metadata")
     transcript2 = await client.get(
-        "/memory/v1/archive/conversations/archive-a",
+        f"/memory/v1/archive/conversations/{conv_a}",
         headers=auth("cc2"),
         params={"limit": 5, "cursor": transcript1_body["next_cursor"]},
     )
-    visible_ids = [item["event_id"] for item in transcript1_body["events"] + transcript2.json()["events"]]
-    require(set(visible_ids) == {"archive-a-1", "archive-a-2"}, f"transcript paging lost/duplicated visible dialogue: {visible_ids}")
+    visible_events = transcript1_body["events"] + transcript2.json()["events"]
+    require(all("event_id" not in item for item in visible_events), f"transcript exposed event ids: {visible_events}")
+    require(
+        {item["content"] for item in visible_events} == {events[0]["content"], events[1]["content"]},
+        f"transcript paging lost/duplicated visible dialogue: {visible_events}",
+    )
     with_system = await client.get(
-        "/memory/v1/archive/conversations/archive-a?limit=10&include_system=true", headers=auth("cc2")
+        f"/memory/v1/archive/conversations/{conv_a}?limit=10&include_system=true", headers=auth("cc2")
     )
     require(
-        {item["event_id"] for item in with_system.json()["events"]}
-        == {"archive-a-1", "archive-a-2", "archive-a-3"},
+        {item["content"] for item in with_system.json()["events"]}
+        == {events[0]["content"], events[1]["content"], events[2]["content"]},
         "explicit system-event view did not return the complete stored transcript",
     )
     source_query = await client.get(
@@ -1557,7 +1592,8 @@ async def test_complete_chat_archive(client: httpx.AsyncClient) -> None:
     )
     assistant_matches = search.json()["matches"] + search2.json()["matches"]
     require(
-        {item["event_id"] for item in assistant_matches} == {"archive-a-2", "archive-b-2"},
+        all("event_id" not in item for item in assistant_matches)
+        and {item["content"] for item in assistant_matches} == {events[1]["content"], events[4]["content"]},
         f"archive search paging/filter drifted: {assistant_matches}",
     )
     literal_wildcard = await client.post(

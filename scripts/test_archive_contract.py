@@ -41,6 +41,12 @@ def main() -> None:
     require("source_client" not in archive_page, "archive UI anchors identity to a source room")
     require("_PUBLIC_ARCHIVE_EVENT_FIELDS" in main_source and "_public_archive_record" in main_source,
             "archive API lost its identity-neutral response projection")
+    public_event_fields = main_source[
+        main_source.index("_PUBLIC_ARCHIVE_EVENT_FIELDS"):main_source.index("def _public_archive_record")
+    ]
+    require('"event_id"' not in public_event_fields, "archive API exposes caller-controlled event ids")
+    require("opaque_archive_identifier" in database_source,
+            "archive storage no longer neutralizes caller-controlled room identifiers")
     whoami_start = main_source.index('async def memory_whoami')
     whoami_end = main_source.index('@app.post("/memory/v1/events/ingest")', whoami_start)
     require('"client_id"' not in main_source[whoami_start:whoami_end],
@@ -58,6 +64,8 @@ def main() -> None:
             "server still accepts plaintext memory-client keys")
     require("MEMORY_CLIENT_KEY_DIGESTS_JSON" in identity_source,
             "memory-client digest configuration is missing")
+    require("is_shared_identity_entry_path" in main_source,
+            "chat/MCP transports lost memory-client authentication")
 
     require("${KIWI_BIND_IP:-127.0.0.1}" in compose, "Docker no longer binds privately by default")
     require('"chat_archive_enabled"' in config_source and '"false"' in config_source, "verbatim archive is not explicit opt-in")

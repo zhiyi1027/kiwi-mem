@@ -78,11 +78,11 @@ No setup needed — isolation is automatic.
 
 ### 🪞 Multiple doors, one autobiographical self
 
-The standalone `/memory/v1` API can be shared by Codex, Claude Code, and future API clients. Each door has a different credential and the server stores SHA-256 digests only. Credentials only record where a request entered. The server assigns one `assistant_identity_id` and one `memory_space_id`, and clients cannot override them. Semantic memories use the assistant's first-person voice; machine provenance remains database audit metadata and is omitted from ordinary archive responses, recalled prose, handoff context, and identity narration.
+The standalone `/memory/v1` API, chat gateway, and both MCP transports can be shared by Codex, Claude Code, and future API clients. Each door has a different credential and the server stores SHA-256 digests only. Credentials only record where a request entered. The server assigns one `assistant_identity_id` and one `memory_space_id`, and clients cannot override them. Semantic memories use the assistant's first-person voice; machine provenance remains database audit metadata and is omitted from ordinary archive responses, recalled prose, handoff context, and identity narration.
 
 The same narrative contract covers automatic extraction, daily consolidation, Dream merge/softening, MemScenes, calendar summaries, and the user profile, and is appended after any custom prompt. Automatic extraction reads only the current session, so concurrent windows cannot be spliced into a conversation that never happened. Assistant memories use first person; facts about Zhizhi use “Zhizhi/she.” Invalid generated output is not stored and cannot retire its source memories first.
 
-The first-person contract governs the assistant's internal semantic memories only. The complete transcript archive is a shared external viewer, so its role labels are shown as “知知/Lyra” and “凛/Grey.”
+The first-person contract governs the assistant's internal semantic memories only. Verbatim chat is never rewritten; the archive viewer labels the roles “知知/Lyra” and “凛/Grey.” Caller-supplied conversation and event IDs are mapped to stable opaque identifiers before storage, so archive responses cannot expose room, account, or machine names.
 
 The admin UI and its data-bearing APIs use a separate Bearer secret. The server verifies only its `KIWI_ADMIN_TOKEN_SHA256` digest and the browser keeps the original secret in the current tab. Docker still binds to `127.0.0.1` by default; authentication is a second layer, not a substitute for a private network boundary.
 
@@ -269,7 +269,7 @@ Memory import is being rebuilt and will return in a future version in a smarter 
 | `KIWI_BIND_IP` | Docker host bind address | `127.0.0.1` |
 | `MEMORY_ASSISTANT_ID` | Assistant identity shared by every memory door | `grey_knox` |
 | `MEMORY_SPACE_ID` | Memory space shared by every memory door | `zhizhi_grey` |
-| `MEMORY_CLIENT_KEY_DIGESTS_JSON` | JSON map from door names to Bearer-key SHA-256 digests | — |
+| `MEMORY_CLIENT_KEY_DIGESTS_JSON` | Door-to-Bearer SHA-256 digest map used by the memory API, chat gateway, and MCP | — |
 | `KIWI_ADMIN_TOKEN_SHA256` | SHA-256 digest of the admin Bearer secret | — |
 | `DEFAULT_MODEL` | Default chat model | `anthropic/claude-sonnet-4` |
 | `PORT` | Gateway port | `8080` |

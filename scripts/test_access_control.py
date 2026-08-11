@@ -13,7 +13,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from access_control import authenticate_admin_token, is_control_plane_path, sha256_digest
+from access_control import (
+    authenticate_admin_token,
+    is_control_plane_path,
+    is_shared_identity_entry_path,
+    sha256_digest,
+)
 
 
 def require(condition, message: str) -> None:
@@ -54,8 +59,12 @@ def main() -> None:
         require(is_control_plane_path(path), f"sensitive route is public: {path}")
     for path in ("/admin", "/admin/", "/admin/js/app.js", "/memory/v1/recall", "/memory/mcp", "/calendar/mcp"):
         require(not is_control_plane_path(path), f"non-control route was accidentally gated: {path}")
+    for path in ("/v1/chat/completions", "/memory/mcp", "/calendar/mcp"):
+        require(is_shared_identity_entry_path(path), f"shared identity transport is public: {path}")
+    for path in ("/memory/v1/recall", "/admin/config", "/"):
+        require(not is_shared_identity_entry_path(path), f"ordinary route entered the transport auth boundary: {path}")
 
-    print("PASS: digest-only credentials and control-plane route guards")
+    print("PASS: digest-only credentials and control/transport route guards")
 
 
 if __name__ == "__main__":

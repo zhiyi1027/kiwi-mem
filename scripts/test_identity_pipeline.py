@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -17,6 +18,7 @@ if str(ROOT) not in sys.path:
 from memory_identity import (
     IDENTITY_NARRATIVE_CONTRACT,
     append_identity_contract,
+    opaque_archive_identifier,
     prepare_generated_memory,
     prepare_scene_fields,
     validate_profile_narrative,
@@ -86,9 +88,31 @@ def main() -> None:
     user_fact, errors = prepare_generated_memory("用户不喜欢香菜。", memory_kind="user_fact")
     require(not errors and user_fact["content"] == "知知不喜欢香菜。", "user label was not normalized")
 
+    for raw, expected in (
+        ("用户爱吃草莓。", "知知爱吃草莓。"),
+        ("用户最近有些失眠。", "知知最近有些失眠。"),
+        ("用户今天很开心。", "知知今天很开心。"),
+        ("用户目前住在上海。", "知知目前住在上海。"),
+        ("用户偶尔会打羽毛球。", "知知偶尔会打羽毛球。"),
+        ("该用户和用户本人都指向同一个人。", "知知和知知都指向同一个人。"),
+    ):
+        record, errors = prepare_generated_memory(raw, memory_kind="user_fact")
+        require(not errors and record["content"] == expected, f"observer label escaped normalization: {raw}")
+
     technical = "知知设计了多用户系统，也在意用户名、用户界面和用户体验。"
     technical_fact, errors = prepare_generated_memory(technical, memory_kind="user_fact")
     require(not errors and technical_fact["content"] == technical, "technical uses of 用户 were corrupted")
+
+    conversation_ref = opaque_archive_identifier("conversation-codex-old", "conversation")
+    event_ref = opaque_archive_identifier("cc_vps1:event:42", "event")
+    require(re.fullmatch(r"conv_[0-9a-f]{64}", conversation_ref), "conversation id is not opaque")
+    require(re.fullmatch(r"evt_[0-9a-f]{64}", event_ref), "event id is not opaque")
+    require(
+        "conversation-codex-old" not in conversation_ref and "cc_vps1:event:42" not in event_ref,
+        "opaque ids retained caller labels",
+    )
+    require(opaque_archive_identifier(conversation_ref, "conversation") == conversation_ref,
+            "opaque archive id is not restore-idempotent")
 
     relationship, errors = prepare_generated_memory("我答应知知不会把自己按入口分开。", memory_kind="relationship")
     require(not errors and relationship["content"].startswith("我答应"), "valid first-person memory rejected")

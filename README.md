@@ -78,11 +78,11 @@ kiwi-mem 内置了 20 多个工具（记忆搜索、日历查询、提醒、联�
 
 ### 🪞 多个入口，仍是同一个“我”
 
-独立的 `/memory/v1` API 可以同时供 Codex、Claude Code 和未来的 API 客户端使用。每个入口使用不同密钥，服务端只保存密钥的 SHA-256 摘要；密钥只记录请求从哪扇门进来，`assistant_identity_id` 与 `memory_space_id` 由服务器统一指定，客户端不能覆盖。语义记忆以助手第一人称保存，来源机器只留在数据库审计元数据中，不通过普通归档 API、召回正文、换窗上下文或身份叙述返回。
+独立的 `/memory/v1` API、聊天网关和两个 MCP 入口可以同时供 Codex、Claude Code 和未来的 API 客户端使用。每个入口使用不同密钥，服务端只保存密钥的 SHA-256 摘要；密钥只记录请求从哪扇门进来，`assistant_identity_id` 与 `memory_space_id` 由服务器统一指定，客户端不能覆盖。语义记忆以助手第一人称保存，来源机器只留在数据库审计元数据中，不通过普通归档 API、召回正文、换窗上下文或身份叙述返回。
 
 这份叙述契约同样覆盖自动提取、每日整理、Dream 合并/软化、MemScene、日历摘要和用户画像，并在自定义 prompt 之后强制追加。自动提取只读取当前会话，多个窗口并行时不会把彼此的最近消息拼成一段虚假经历。关于助手的记忆使用“我”，关于知知的事实使用“知知/她”；违反契约的自动产物不会入库，也不会先归档其来源记忆。
 
-第一人称契约只约束助手内部的语义记忆。完整聊天归档是双方共同翻阅的外部界面，角色标签显示为“知知/Lyra”与“凛/Grey”。
+第一人称契约只约束助手内部的语义记忆。完整聊天原文不会被改写；归档查看器的角色标签显示为“知知/Lyra”与“凛/Grey”。调用方提供的会话与事件 ID 在入库前会映射为稳定的不透明标识，归档响应不会出现房间、账号或机器名称。
 
 管理面板及其读写接口使用独立 Bearer 密钥，服务端通过 `KIWI_ADMIN_TOKEN_SHA256` 校验摘要，原始密钥只保存在浏览器当前标签页。Docker 仍默认仅绑定 `127.0.0.1`；管理认证是第二层保护，不能替代私网边界。
 
@@ -183,11 +183,11 @@ API_KEY=
 # 必填：管理面原始密钥的 SHA-256 摘要
 KIWI_ADMIN_TOKEN_SHA256=<64位摘要>
 
-# 使用 /memory/v1/* 时必填：每扇入口原始密钥的 SHA-256 摘要
+# 使用 /memory/v1/*、/v1/chat/completions 或 MCP 时必填：每扇入口原始密钥的 SHA-256 摘要
 MEMORY_CLIENT_KEY_DIGESTS_JSON={"codex_vps2":"<64位摘要>","cc_vps1":"<64位摘要>"}
 ```
 
-> 🔐 `/memory/v1/*` 使用各入口自己的 Bearer 密钥；管理面、调试、Dream、日历和同步接口使用独立管理密钥。服务端均只保存 SHA-256 摘要。旧版聊天网关与 MCP 传输本身仍不是公网认证边界，因此整个服务只应放在私网/Tailscale 中，或由严格的反向代理路由白名单保护。开启完整聊天归档后，不要把服务直接暴露在公网。Docker Compose 默认只绑定 `127.0.0.1`；跨机访问时将 `KIWI_BIND_IP` 设为私网/Tailscale IP。
+> 🔐 `/memory/v1/*`、`/v1/chat/completions` 和两个 MCP 入口使用各入口自己的 Bearer 密钥；管理面、调试、Dream、日历和同步接口使用独立管理密钥。服务端均只保存 SHA-256 摘要。认证不能替代网络隔离：开启完整聊天归档后仍不要把服务直接暴露在公网。Docker Compose 默认只绑定 `127.0.0.1`；跨机访问时将 `KIWI_BIND_IP` 设为私网/Tailscale IP。
 
 保存后启动：
 ```bash
@@ -422,7 +422,7 @@ https://你的域名/admin
 | `KIWI_BIND_IP` | Docker 宿主机绑定地址 | `127.0.0.1` |
 | `MEMORY_ASSISTANT_ID` | 所有记忆入口共享的助手身份 ID | `grey_knox` |
 | `MEMORY_SPACE_ID` | 所有记忆入口共享的空间 ID | `zhizhi_grey` |
-| `MEMORY_CLIENT_KEY_DIGESTS_JSON` | 入口名到 Bearer 密钥 SHA-256 摘要的 JSON 映射 | — |
+| `MEMORY_CLIENT_KEY_DIGESTS_JSON` | 记忆 API、聊天网关与 MCP 共用的入口名→Bearer 密钥 SHA-256 摘要映射 | — |
 | `KIWI_ADMIN_TOKEN_SHA256` | 管理面 Bearer 密钥的 SHA-256 摘要 | — |
 | `DEFAULT_MODEL` | 默认聊天模型 | `anthropic/claude-sonnet-4` |
 | `PORT` | 端口 | `8080` |

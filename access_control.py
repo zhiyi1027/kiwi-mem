@@ -75,15 +75,31 @@ _CONTROL_PREFIXES = (
 )
 _PUBLIC_ADMIN_PATHS = ("/admin", "/admin/")
 _PUBLIC_ADMIN_ASSET_PREFIXES = ("/admin/css/", "/admin/js/", "/admin/assets/")
+_SHARED_IDENTITY_ENTRY_PATHS = (
+    "/v1/chat/completions",
+    "/memory/mcp",
+    "/calendar/mcp",
+)
+
+
+def is_shared_identity_entry_path(path: str) -> bool:
+    """Return whether a network entry must authenticate as a memory client.
+
+    These transports are intentionally separate from the operator/admin plane,
+    but they can read memories, spend the configured model key, or invoke MCP
+    tools that carry an internal control capability.  A caller therefore has
+    to identify one configured door before the request reaches the transport.
+    """
+    clean = str(path or "")
+    return any(clean == prefix or clean.startswith(prefix + "/") for prefix in _SHARED_IDENTITY_ENTRY_PATHS)
 
 
 def is_control_plane_path(path: str) -> bool:
     """Return whether a request must carry an admin or internal capability.
 
     The HTML/JS/CSS shell is public but contains no data.  Every dynamic route
-    used by that shell is protected.  Mounted MCP transport paths remain on
-    their own boundary; their internal loopback calls carry a process-local
-    capability.
+    used by that shell is protected.  Mounted MCP transports and the chat
+    gateway are protected separately by memory-client authentication.
     """
     clean = str(path or "")
     if clean in _PUBLIC_ADMIN_PATHS or clean.startswith(_PUBLIC_ADMIN_ASSET_PREFIXES):
