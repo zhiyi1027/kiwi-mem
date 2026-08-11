@@ -132,7 +132,7 @@ Visit `http://localhost:8080` — if you see `{"status":"running"}`, you're good
 - Point your chat client's API endpoint to `http://localhost:8080/v1`
 - Works with any OpenAI-format frontend: ChatBox, NextChat, SillyTavern, or your own
 
-> 🔐 The shared-identity `/memory/v1/*` API requires its own Bearer credentials. The legacy chat gateway, admin panel, debug, and sync endpoints still have no built-in authentication. Keep the service on a private network or Tailscale, or protect the whole service with Cloudflare Access, reverse-proxy authentication, or an IP allowlist. Pay special attention to `/admin`, `/sync/export`, and `/sync/import-backup`.
+> 🔐 The shared-identity `/memory/v1/*` API requires its own Bearer credentials. The legacy chat gateway, admin panel, debug, and sync endpoints still have no built-in authentication. Keep the service on a private network or Tailscale, or protect the entire service with Cloudflare Access, reverse-proxy authentication, or an IP allowlist. Pay special attention to `/admin`, `/sync/export`, and `/sync/import-backup`; these legacy endpoints are not authenticated by kiwi-mem itself.
 
 > 💡 80+ parameters can be changed at runtime via the admin panel — no restart needed.
 

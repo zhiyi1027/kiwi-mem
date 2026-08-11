@@ -175,7 +175,7 @@ nano .env
 API_KEY=
 ```
 
-> 🔐 `/memory/v1/*` 共享身份记忆 API 使用独立 Bearer 密钥鉴权。旧版聊天网关、管理面板和调试/同步端点仍没有内建鉴权；请只在私网或 Tailscale 内开放，或使用 Cloudflare Access、反向代理鉴权、IP 白名单保护整个服务。尤其要保护 `/admin`、`/sync/export` 和 `/sync/import-backup`。
+> 🔐 `/memory/v1/*` 共享身份记忆 API 使用独立 Bearer 密钥鉴权。旧版聊天网关、管理面板和调试/同步端点仍没有内建鉴权；请只在私网或 Tailscale 内开放，或使用 Cloudflare Access、反向代理鉴权、IP 白名单保护整个服务。尤其要保护 `/admin`、`/sync/export` 和 `/sync/import-backup`，这些旧端点没有内建鉴权。
 
 保存后启动：
 ```bash
