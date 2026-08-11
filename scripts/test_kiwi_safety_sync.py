@@ -1408,7 +1408,15 @@ async def async_main() -> int:
     try:
         database_name, test_dsn = await _create_disposable_database(admin_dsn)
         print(f"Created disposable PostgreSQL database: {database_name}")
-        await run_suite(test_dsn)
+        try:
+            await run_suite(test_dsn)
+        except Exception as exc:
+            # Public GitHub check annotations remain inspectable even when raw
+            # Actions logs require an authenticated browser session.
+            message = f"{type(exc).__name__}: {exc}"
+            message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            print(f"::error title=kiwi safety suite failed::{message}")
+            raise
         legacy_passed = [name for name in PASSED if name.startswith("T-S")]
         w1_01_passed = [name for name in PASSED if name.startswith("T-W1-01-")]
         continuity_passed = [name for name in PASSED if name.startswith("T-CONT-")]
