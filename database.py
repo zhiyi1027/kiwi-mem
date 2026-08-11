@@ -98,8 +98,13 @@ async def init_tables():
                 role            TEXT NOT NULL,
                 content         TEXT NOT NULL,
                 model           TEXT,
-                created_at      TIMESTAMPTZ DEFAULT NOW()
+                created_at      TIMESTAMPTZ DEFAULT NOW(),
+                superseded_at   TIMESTAMPTZ
             );
+        """)
+        await conn.execute("""
+            ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ
         """)
         
         await conn.execute("""
@@ -631,6 +636,52 @@ async def init_tables():
             await conn.execute("ALTER TABLE memories ADD COLUMN resolution FLOAT DEFAULT 1.0")
             print("✅ memories 表已添加 resolution 列（记忆软化系统）")
 
+        # Continuity profile: automatic aging may hide a memory from normal recall,
+        # but it must never destroy the evidence or an earlier representation.
+        for col_name, col_def in [
+            ("archived_at", "TIMESTAMPTZ DEFAULT NULL"),
+            ("archive_reason", "TEXT DEFAULT NULL"),
+        ]:
+            has_col = await conn.fetchval("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'memories' AND column_name = $1
+                )
+            """, col_name)
+            if not has_col:
+                await conn.execute(f"ALTER TABLE memories ADD COLUMN {col_name} {col_def}")
+                print(f"✅ memories 表已添加 {col_name} 列（非破坏式归档）")
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_versions (
+                id              BIGSERIAL PRIMARY KEY,
+                memory_id       INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                version         INTEGER NOT NULL,
+                content         TEXT NOT NULL,
+                title           TEXT DEFAULT '',
+                resolution      FLOAT DEFAULT 1.0,
+                embedding       TEXT,
+                change_type     TEXT NOT NULL DEFAULT 'original',
+                created_at      TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(memory_id, version)
+            )
+        """)
+        await conn.execute("""
+            INSERT INTO memory_versions
+                (memory_id, version, content, title, resolution, embedding, change_type, created_at)
+            SELECT m.id, 1, m.content, COALESCE(m.title, ''),
+                   COALESCE(m.resolution, 1.0), m.embedding, 'original', m.created_at
+            FROM memories m
+            WHERE NOT EXISTS (
+                SELECT 1 FROM memory_versions mv WHERE mv.memory_id = m.id
+            )
+            ON CONFLICT (memory_id, version) DO NOTHING
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memory_versions_memory
+            ON memory_versions (memory_id, version DESC)
+        """)
+
         # v6.2：providers 表添加 api_format 列（openai / anthropic）
         has_api_format = await conn.fetchval("""
             SELECT EXISTS (
@@ -922,14 +973,23 @@ async def save_message(session_id: str, role: str, content: str, model: str = ""
 
 
 async def delete_latest_assistant_message(session_id: str):
+    """Retire the latest generated reply while preserving the raw transcript.
+
+    Regeneration used to physically delete the previous assistant message.  The
+    row is now only marked superseded, so active context ignores it while the
+    evidence layer remains complete.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            DELETE FROM conversations
+            UPDATE conversations
+            SET superseded_at = NOW()
             WHERE id = (
                 SELECT id FROM conversations
-                WHERE session_id = $1 AND role = 'assistant'
+                WHERE session_id = $1
+                  AND role = 'assistant'
+                  AND superseded_at IS NULL
                 ORDER BY created_at DESC
                 LIMIT 1
             )
@@ -942,7 +1002,10 @@ async def get_recent_messages(session_id: str, limit: int = 20):
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT role, content, created_at FROM conversations WHERE session_id = $1 ORDER BY created_at DESC LIMIT $2",
+            """SELECT role, content, created_at
+               FROM conversations
+               WHERE session_id = $1 AND superseded_at IS NULL
+               ORDER BY created_at DESC LIMIT $2""",
             session_id, limit,
         )
         return list(reversed(rows))
@@ -953,7 +1016,10 @@ async def get_recent_conversation(limit: int = 20):
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT role, content, created_at FROM conversations ORDER BY created_at DESC LIMIT $1",
+            """SELECT role, content, created_at
+               FROM conversations
+               WHERE superseded_at IS NULL
+               ORDER BY created_at DESC LIMIT $1""",
             limit,
         )
         return list(reversed(rows))
@@ -1063,10 +1129,17 @@ async def save_memory(content: str, importance: int = 5, source_session: str = "
     
     pool = await get_pool()
     async with pool.acquire() as conn:
-        new_id = await conn.fetchval(
-            "INSERT INTO memories (content, importance, source_session, embedding, title, category_id, source, emotional_weight, project_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
-            content, importance, source_session, embedding_json, title, category_id, source, emotional_weight, project_id,
-        )
+        async with conn.transaction():
+            new_id = await conn.fetchval(
+                "INSERT INTO memories (content, importance, source_session, embedding, title, category_id, source, emotional_weight, project_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+                content, importance, source_session, embedding_json, title, category_id, source, emotional_weight, project_id,
+            )
+            await conn.execute("""
+                INSERT INTO memory_versions
+                    (memory_id, version, content, title, resolution, embedding, change_type)
+                VALUES ($1, 1, $2, $3, 1.0, $4, 'original')
+                ON CONFLICT (memory_id, version) DO NOTHING
+            """, new_id, content, title or "", embedding_json)
     
     emo_tag = f" 🩷emo={emotional_weight}" if emotional_weight > 0 else ""
     proj_tag = f" 📂proj={project_id}" if project_id else ""
@@ -1152,13 +1225,83 @@ async def clear_all_memories() -> int:
         )
 
 
+async def search_archived_memories(query: str = "", limit: int = 20) -> list:
+    """Search memories that have left normal recall, including old versions.
+
+    This path is intentionally explicit and does not heat or reactivate rows.
+    It gives users and agents a way to inspect cold history without injecting it
+    into every conversation.
+    """
+    limit = max(1, min(int(limit or 20), 200))
+    pattern = f"%{(query or '').strip()}%"
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT m.id,
+                   m.title,
+                   COALESCE(
+                       (
+                           SELECT mv.content
+                           FROM memory_versions mv
+                           WHERE mv.memory_id = m.id
+                             AND ($1 = '%%' OR mv.content ILIKE $1)
+                           ORDER BY mv.version DESC
+                           LIMIT 1
+                       ),
+                       m.content
+                   ) AS content,
+                   m.importance,
+                   m.is_permanent,
+                   m.memory_type,
+                   m.source,
+                   m.project_id,
+                   m.resolution,
+                   m.created_at,
+                   m.valid_until,
+                   m.archived_at,
+                   m.archive_reason
+            FROM memories m
+            WHERE (
+                    m.archived_at IS NOT NULL
+                    OR (m.valid_until IS NOT NULL AND m.valid_until <= NOW())
+                    OR m.memory_type = 'dream_deleted'
+                  )
+              AND (
+                    $1 = '%%'
+                    OR m.title ILIKE $1
+                    OR m.content ILIKE $1
+                    OR EXISTS (
+                        SELECT 1 FROM memory_versions mv
+                        WHERE mv.memory_id = m.id AND mv.content ILIKE $1
+                    )
+                  )
+            ORDER BY COALESCE(m.archived_at, m.valid_until, m.created_at) DESC
+            LIMIT $2
+        """, pattern, limit)
+    return [dict(row) for row in rows]
+
+
+async def get_memory_versions(memory_id: int) -> list:
+    """Return the immutable representation history for one memory."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, memory_id, version, content, title, resolution,
+                   embedding, change_type, created_at
+            FROM memory_versions
+            WHERE memory_id = $1
+            ORDER BY version ASC
+        """, memory_id)
+    return [dict(row) for row in rows]
+
+
 async def update_memory(memory_id: int, content: str = None, importance: int = None, title: str = None, category_id: object = "UNSET") -> bool:
     """更新单条记忆的内容、标题、重要程度或分类（内容/标题变化时重新生成 embedding）"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         # 先获取当前记录（用于合并 embedding 生成）
         current = await conn.fetchrow(
-            "SELECT content, title FROM memories WHERE id = $1", memory_id
+            "SELECT content, title, embedding, resolution FROM memories WHERE id = $1", memory_id
         )
         if not current:
             return False
@@ -1210,8 +1353,31 @@ async def update_memory(memory_id: int, content: str = None, importance: int = N
         
         params.append(memory_id)
         sql = f"UPDATE memories SET {', '.join(sets)} WHERE id = ${idx}"
-        result = await conn.execute(sql, *params)
-        return result == "UPDATE 1"
+        async with conn.transaction():
+            # Preserve the pre-edit representation, including on an upgraded
+            # database whose version backfill has not run yet.
+            if need_re_embed:
+                await conn.execute("""
+                    INSERT INTO memory_versions
+                        (memory_id, version, content, title, resolution, embedding, change_type)
+                    VALUES ($1, 1, $2, $3, $4, $5, 'original')
+                    ON CONFLICT (memory_id, version) DO NOTHING
+                """, memory_id, current["content"], current["title"] or "",
+                     current.get("resolution") or 1.0, current.get("embedding"))
+
+            result = await conn.execute(sql, *params)
+            if result == "UPDATE 1" and need_re_embed:
+                next_version = await conn.fetchval("""
+                    SELECT COALESCE(MAX(version), 0) + 1
+                    FROM memory_versions WHERE memory_id = $1
+                """, memory_id)
+                await conn.execute("""
+                    INSERT INTO memory_versions
+                        (memory_id, version, content, title, resolution, embedding, change_type)
+                    VALUES ($1, $2, $3, $4, $5, COALESCE($6, $7), 'manual_update')
+                """, memory_id, next_version, new_content, new_title,
+                     current.get("resolution") or 1.0, embedding_json, current.get("embedding"))
+            return result == "UPDATE 1"
 
 
 # ============================================================
@@ -1621,12 +1787,15 @@ async def _check_auto_lock(memory_ids: list, heat_params: dict = None):
 
 async def soften_memory(memory_id: int, softened_content: str, target_resolution: float = 0.5, extend_days: int = 30) -> bool:
     """
-    软化一条记忆 —— 用 LLM 压缩后的内容替换原文，降低精度但延长寿命。
+    软化一条记忆。
+
+    memories 表保留当前用于召回的表示；memory_versions 永久保存原始
+    内容和每次派生表示。软化只能追加版本，不能抹掉任何先前文本。
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, title, content, is_permanent, resolution FROM memories WHERE id = $1",
+            "SELECT id, title, content, embedding, is_permanent, resolution FROM memories WHERE id = $1",
             memory_id
         )
         if not row:
@@ -1656,18 +1825,44 @@ async def soften_memory(memory_id: int, softened_content: str, target_resolution
         embedding_json = json.dumps(embedding) if embedding else None
         if embedding is None:
             print(f"   ⚠️ 软化 embedding 生成失败: #{memory_id} 保留旧向量")
-        await conn.execute("""
-            UPDATE memories
-            SET content = $1,
-                resolution = $2,
-                embedding = COALESCE($3, embedding),
-                valid_until = GREATEST(
-                    COALESCE(valid_until, NOW() + $4 * INTERVAL '1 day'),
-                    NOW() + $4 * INTERVAL '1 day'
-                ),
-                softened_at = NOW()
-            WHERE id = $5
-        """, softened_content, target_resolution, embedding_json, extend_days, memory_id)
+        async with conn.transaction():
+            # Serialize concurrent softening and guarantee an immutable original
+            # exists even for databases created before memory_versions.
+            current = await conn.fetchrow("""
+                SELECT id, title, content, embedding, resolution
+                FROM memories WHERE id = $1 FOR UPDATE
+            """, memory_id)
+            if not current:
+                return False
+            await conn.execute("""
+                INSERT INTO memory_versions
+                    (memory_id, version, content, title, resolution, embedding, change_type)
+                VALUES ($1, 1, $2, $3, $4, $5, 'original')
+                ON CONFLICT (memory_id, version) DO NOTHING
+            """, memory_id, current["content"], current["title"] or "",
+                 current.get("resolution") or 1.0, current.get("embedding"))
+            next_version = await conn.fetchval("""
+                SELECT COALESCE(MAX(version), 0) + 1
+                FROM memory_versions WHERE memory_id = $1
+            """, memory_id)
+            await conn.execute("""
+                INSERT INTO memory_versions
+                    (memory_id, version, content, title, resolution, embedding, change_type)
+                VALUES ($1, $2, $3, $4, $5, COALESCE($6, $7), 'softened')
+            """, memory_id, next_version, softened_content, current["title"] or "",
+                 target_resolution, embedding_json, current.get("embedding"))
+            await conn.execute("""
+                UPDATE memories
+                SET content = $1,
+                    resolution = $2,
+                    embedding = COALESCE($3, embedding),
+                    valid_until = GREATEST(
+                        COALESCE(valid_until, NOW() + $4 * INTERVAL '1 day'),
+                        NOW() + $4 * INTERVAL '1 day'
+                    ),
+                    softened_at = NOW()
+                WHERE id = $5
+            """, softened_content, target_resolution, embedding_json, extend_days, memory_id)
         title_tag = row["title"] or f"#{memory_id}"
         old_len = len(row["content"])
         new_len = len(softened_content)
@@ -3647,13 +3842,17 @@ async def mark_memories_dreamed(memory_ids: list):
 
 
 async def soft_delete_memories(memory_ids: list):
-    """软删除记忆（标记为deleted，不真正删除）"""
+    """将 Dream 淘汰项移出正常召回，但永久保留原始行。"""
     if not memory_ids:
         return
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("""
-            UPDATE memories SET memory_type = 'dream_deleted'
+            UPDATE memories
+            SET memory_type = 'dream_deleted',
+                valid_until = COALESCE(valid_until, NOW()),
+                archived_at = COALESCE(archived_at, NOW()),
+                archive_reason = COALESCE(archive_reason, 'dream_archived')
             WHERE id = ANY($1::int[])
         """, memory_ids)
 

@@ -30,6 +30,7 @@ from database import (
     track_memory_recall, touch_permanent_memories, search_scenes,
     get_all_memories_count, get_recent_memories, get_recent_conversation, delete_memory,
     batch_delete_memories_guarded, clear_all_memories, update_memory, check_memory_duplicate,
+    search_archived_memories, get_memory_versions,
     migrate_embeddings, backfill_permanent_memory_embeddings, get_embedding_stats,
     # v5.3 时间有效期 + 矛盾检测
     invalidate_memory, create_memory_edge, detect_contradictions,
@@ -3229,6 +3230,53 @@ async def debug_memories(
         return {"error": str(e)}
 
 
+@app.get("/debug/memory-archive")
+async def debug_memory_archive(q: str = "", limit: int = 20):
+    """显式检索已经退出日常召回的冷记忆与历史版本。"""
+    if not await get_memory_enabled():
+        return {"error": "记忆系统未启用"}
+    try:
+        memories = await search_archived_memories(q, limit=limit)
+        return {
+            "query": q or "(最近归档)",
+            "total_memories": len(memories),
+            "memories": [
+                {
+                    **memory,
+                    "created_at": str(memory.get("created_at")),
+                    "valid_until": str(memory.get("valid_until")) if memory.get("valid_until") else None,
+                    "archived_at": str(memory.get("archived_at")) if memory.get("archived_at") else None,
+                }
+                for memory in memories
+            ],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/debug/memories/{memory_id}/versions")
+async def debug_memory_versions(memory_id: int):
+    """查看一条记忆的不可变原文与所有派生版本。"""
+    if not await get_memory_enabled():
+        return {"error": "记忆系统未启用"}
+    try:
+        versions = await get_memory_versions(memory_id)
+        if not versions:
+            return JSONResponse(status_code=404, content={"error": f"记忆 #{memory_id} 不存在或没有版本"})
+        return {
+            "memory_id": memory_id,
+            "versions": [
+                {
+                    **version,
+                    "created_at": str(version.get("created_at")),
+                }
+                for version in versions
+            ],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.delete("/debug/memories/{memory_id}")
 async def delete_single_memory(memory_id: int, force: bool = False):
     """删除单条记忆；锁定记忆默认受保护，显式 force 才放行。"""
@@ -5180,8 +5228,12 @@ async def api_sync_export():
         # 记忆
         pool = await get_pool()
         async with pool.acquire() as conn:
-            mem_rows = await conn.fetch("SELECT id, content, importance, title, memory_type, source, category_id, created_at FROM memories ORDER BY created_at DESC")
+            mem_rows = await conn.fetch("SELECT * FROM memories ORDER BY created_at DESC")
+            version_rows = await conn.fetch("""
+                SELECT * FROM memory_versions ORDER BY memory_id, version
+            """)
         memories = [_serialize_datetimes(dict(r)) for r in mem_rows]
+        memory_versions = [_serialize_datetimes(dict(r)) for r in version_rows]
 
         # 配置
         all_config = await get_all_config()
@@ -5201,6 +5253,7 @@ async def api_sync_export():
             zf.writestr("conversations.json", json.dumps(convs_full, ensure_ascii=False, indent=2))
             zf.writestr("projects.json", json.dumps(projs, ensure_ascii=False, indent=2))
             zf.writestr("memories.json", json.dumps(memories, ensure_ascii=False, indent=2))
+            zf.writestr("memory_versions.json", json.dumps(memory_versions, ensure_ascii=False, indent=2))
             zf.writestr("config.json", json.dumps(config_flat, ensure_ascii=False, indent=2))
             zf.writestr("settings.json", json.dumps(settings, ensure_ascii=False, indent=2))
         buf.seek(0)
@@ -5231,6 +5284,19 @@ def _serialize_datetimes(obj):
     return obj
 
 
+def _parse_backup_datetime(value):
+    """Parse an exported ISO timestamp without inventing a value for nulls."""
+    from datetime import datetime as _dt
+    if not value:
+        return None
+    if isinstance(value, _dt):
+        return value
+    try:
+        return _dt.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
 # ──── 数据导入（从备份 zip 恢复） ────
 
 @app.post("/sync/import-backup")
@@ -5247,7 +5313,7 @@ async def api_sync_import_backup(file: UploadFile = File(...)):
             return JSONResponse(status_code=400, content={"error": "不是有效的 zip 文件"})
 
         buf.seek(0)
-        result = {"conversations": 0, "messages": 0, "projects": 0, "memories": 0, "settings": 0, "config": 0}
+        result = {"conversations": 0, "messages": 0, "projects": 0, "memories": 0, "memory_versions": 0, "settings": 0, "config": 0}
 
         with zipfile.ZipFile(buf, 'r') as zf:
             names = zf.namelist()
@@ -5271,20 +5337,84 @@ async def api_sync_import_backup(file: UploadFile = File(...)):
                     result["conversations"] += 1
 
             # 导入记忆
+            memory_id_map = {}
             if "memories.json" in names:
                 mems = json.loads(zf.read("memories.json"))
                 for mem in mems:
                     try:
-                        await save_memory(
+                        new_memory_id = await save_memory(
                             content=mem.get("content", ""),
                             importance=mem.get("importance", 5),
                             title=mem.get("title", ""),
                             category_id=mem.get("category_id"),
                             source=mem.get("source", "backup_import"),
+                            source_session=mem.get("source_session", ""),
+                            emotional_weight=mem.get("emotional_weight", 0) or 0,
+                            project_id=mem.get("project_id"),
                         )
+                        memory_id_map[mem.get("id")] = new_memory_id
+                        pool = await get_pool()
+                        async with pool.acquire() as conn:
+                            await conn.execute("""
+                                UPDATE memories
+                                SET memory_type = $2,
+                                    is_permanent = $3,
+                                    lock_source = $4,
+                                    created_at = COALESCE($5, created_at),
+                                    last_accessed = COALESCE($6, last_accessed),
+                                    valid_from = COALESCE($7, valid_from),
+                                    valid_until = $8,
+                                    softened_at = $9,
+                                    resolution = COALESCE($10, resolution),
+                                    dream_processed_at = $11,
+                                    archived_at = $12,
+                                    archive_reason = $13
+                                WHERE id = $1
+                            """, new_memory_id,
+                                 mem.get("memory_type", "fragment"),
+                                 bool(mem.get("is_permanent", False)),
+                                 mem.get("lock_source"),
+                                 _parse_backup_datetime(mem.get("created_at")),
+                                 _parse_backup_datetime(mem.get("last_accessed")),
+                                 _parse_backup_datetime(mem.get("valid_from")),
+                                 _parse_backup_datetime(mem.get("valid_until")),
+                                 _parse_backup_datetime(mem.get("softened_at")),
+                                 mem.get("resolution", 1.0),
+                                 _parse_backup_datetime(mem.get("dream_processed_at")),
+                                 _parse_backup_datetime(mem.get("archived_at")),
+                                 mem.get("archive_reason"))
                         result["memories"] += 1
                     except Exception:
                         pass  # 跳过重复或无效记忆
+
+            # 版本在所有主记忆建立 ID 映射后恢复。save_memory 自动创建的
+            # version=1 会由备份中的不可变原始版本覆盖。
+            if "memory_versions.json" in names and memory_id_map:
+                versions = json.loads(zf.read("memory_versions.json"))
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    for version in versions:
+                        new_memory_id = memory_id_map.get(version.get("memory_id"))
+                        if not new_memory_id:
+                            continue
+                        await conn.execute("""
+                            INSERT INTO memory_versions
+                                (memory_id, version, content, title, resolution,
+                                 embedding, change_type, created_at)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, NOW()))
+                            ON CONFLICT (memory_id, version) DO UPDATE SET
+                                content = EXCLUDED.content,
+                                title = EXCLUDED.title,
+                                resolution = EXCLUDED.resolution,
+                                embedding = EXCLUDED.embedding,
+                                change_type = EXCLUDED.change_type,
+                                created_at = EXCLUDED.created_at
+                        """, new_memory_id, version.get("version", 1),
+                             version.get("content", ""), version.get("title", ""),
+                             version.get("resolution", 1.0), version.get("embedding"),
+                             version.get("change_type", "original"),
+                             _parse_backup_datetime(version.get("created_at")))
+                        result["memory_versions"] += 1
 
             # 导入同步设置
             if "settings.json" in names:

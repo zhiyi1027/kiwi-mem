@@ -41,7 +41,7 @@ mcp_memory = FastMCP("Memory Garden", stateless_http=True)
 
 
 @mcp_memory.tool()
-async def search_memory(query: str, limit: int = 10) -> str:
+async def search_memory(query: str, limit: int = 10, include_archived: bool = False) -> str:
     """
     [category: memory]
 
@@ -50,6 +50,7 @@ async def search_memory(query: str, limit: int = 10) -> str:
     参数：
     - query: 搜索关键词或自然语言描述，比如"用户的健康记录"、"上周聊了什么"
     - limit: 返回条数上限（默认10，最大50）
+    - include_archived: 是否显式搜索已退出日常召回的冷记忆和历史版本
 
     返回匹配的记忆列表，每条包含标题、内容、重要度、日期。
     """
@@ -59,7 +60,7 @@ async def search_memory(query: str, limit: int = 10) -> str:
     try:
         async with httpx.AsyncClient(timeout=15, headers=GATEWAY_HEADERS) as client:
             resp = await client.get(
-                f"{GATEWAY_BASE}/debug/memories",
+                f"{GATEWAY_BASE}/debug/memory-archive" if include_archived else f"{GATEWAY_BASE}/debug/memories",
                 params={"q": query, "limit": limit},
             )
             data = resp.json()
@@ -70,9 +71,11 @@ async def search_memory(query: str, limit: int = 10) -> str:
         # /debug/memories 返回字段是 memories；保留对旧版 results 的兼容
         results = data.get("memories") or data.get("results", [])
         if not results:
-            return f"没有找到与「{query}」相关的记忆。"
+            scope = "冷记忆与历史版本" if include_archived else "活跃记忆"
+            return f"没有在{scope}中找到与「{query}」相关的内容。"
 
-        lines = [f"找到 {len(results)} 条相关记忆（共 {data.get('total_memories', '?')} 条）：\n"]
+        scope = "冷记忆/历史" if include_archived else "活跃记忆"
+        lines = [f"在{scope}中找到 {len(results)} 条相关记忆（共 {data.get('total_memories', '?')} 条）：\n"]
         for i, mem in enumerate(results, 1):
             title = mem.get("title", "")
             title_tag = f"【{title}】" if title else ""

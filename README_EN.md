@@ -10,9 +10,9 @@
 
 kiwi-mem gives your AI long-term memory that works like a human brain.
 
-Not "save chat logs and search them later" — actually human-like: things you don't mention gradually fade, things you talk about often stick harder, a night of sleep reorganizes scattered fragments into deeper understanding, last year's events compress into rough outlines while yesterday stays vivid.
+Not just "save chat logs and search them later" — heat controls what the AI recalls proactively: things you do not mention gradually leave everyday injection, things you revisit become stronger, and sleep reorganizes fragments into deeper understanding. Raw records and every memory representation remain preserved.
 
-All of these mechanisms work together as a unified filtering system: **your AI remembers what you'd remember, and forgets what neither of you would care about.** Without blowing up the context window or burning through your API budget.
+All of these mechanisms work together as a unified filtering system: **cold memories may become quiet, but automatic maintenance never erases them.** Recall priority can decay while historical evidence does not, without blowing up the context window or burning through your API budget.
 
 Technically, it's a lightweight proxy gateway that sits between you and any LLM, compatible with both OpenAI-format and Anthropic-native providers. Docker one-click deploy, browser-based admin panel.
 
@@ -38,11 +38,11 @@ The core of kiwi-mem isn't any single feature — it's multiple mechanisms worki
 
 ### 🔥 Fades and strengthens
 
-Every memory has a "heat" score. Time makes it naturally decay, but if you keep bringing up the same topic, it warms back up. High-emotion memories decay slower — just like how you remember moments that moved you. And fading isn't an on/off switch: aging memories are gently blurred each night, details softening while key facts remain; if a blurred memory gets recalled in conversation, it automatically earns another 30 days. Only memories actually written into the conversation count as "recalled" — only the cold and old get cleaned up, by heat. Forgetting is gradual, like it is for people. Heat also determines how memories enter the conversation: hot memories get injected in full, warm ones as summaries, cold ones stay quiet.
+Every memory has a "heat" score. Time makes it naturally decay, but if you keep bringing up the same topic, it warms back up. Aging memories may receive shorter derived representations, while the original and every derived version remain in `memory_versions`. Low heat only causes non-destructive archival: the row leaves automatic injection but remains available for historical search and restoration. Hot memories are injected in full, warm ones as summaries, and cold ones stay quiet.
 
 ### 🌙 Sleeps and wakes up smarter
 
-Dream simulates how the human brain consolidates memories during sleep. It works in three layers: first cleans up outdated and duplicate fragments, then merges related fragments into coherent "memory scenes", and finally infers things you never explicitly said but your AI should understand. You can trigger it manually, or let the system decide when it's time to sleep. And dreams aren't forgotten on waking — consolidated scenes carry vector indexes, so when a related topic comes up during the day, they get found and flow back into the conversation. Sleep's output returns to waking life. That's what consolidation is for.
+Dream simulates how the human brain consolidates memories during sleep. It works in three layers: first archives outdated and duplicate fragments out of normal recall, then merges related fragments into coherent "memory scenes", and finally infers things you never explicitly said but your AI should understand. Archival never physically deletes the source fragments. Consolidated scenes carry vector indexes, so related topics can bring them back into conversation.
 
 ### 📅 Recent is vivid, distant is hazy
 
@@ -50,7 +50,7 @@ The calendar system auto-compresses chat history into hierarchical summaries: da
 
 ### 🧩 Contradictions update, important things stick
 
-When a new memory conflicts with an old one (you changed jobs, moved cities), the system auto-invalidates the outdated version. Memories you lock by hand are sacred — they never decay, never retire, never auto-delete. Machine-locked memories (auto-locks and Dream promotions) have an exit path instead: if nobody asks about them for 90 days, they get demoted from "permanent" back to high-importance regular memories (reversible, never deleted), freeing precious injection space for what's actually alive.
+When a new memory conflicts with an old one (you changed jobs, moved cities), the old version leaves default recall while its text and `supersedes` relationship remain historically traceable. Memories you lock by hand are sacred — they never decay, retire, or auto-archive. Machine-locked memories can be demoted after 90 days without recall, but are never deleted.
 
 ### ⚡ Budget and context aware
 
@@ -184,12 +184,12 @@ Memory import is being rebuilt and will return in a future version in a smarter 
 - Time decay (half-life) · recall heating · query diversity · emotional weight
 - Only memories actually injected into the prompt count as recalled; recalled low-resolution memories are extended by 30 days
 - Tiered injection (hot → full text / warm → summary / cold → skip)
-- Nightly softening can progressively compress old memories, with a 21-day cooldown by default; old embeddings are kept if regeneration fails
+- Nightly softening appends derived versions with a 21-day cooldown; the original and every earlier version remain immutable
 - User locks never retire; auto locks and Dream-promoted locks can retire after 90 days without recall, but are not deleted
 - Dream merge outputs keep a default floor of 20 items, and MemScenes can flow back into normal chat by vector similarity
 
 ### 🌙 Dream consolidation
-- Cleanup layer (remove outdated / duplicate / contradictory fragments)
+- Archive layer (move outdated / duplicate / contradictory fragments out of normal recall without deleting them)
 - Consolidation layer (fragments → MemScenes)
 - Growth layer (Foresight — infer implications)
 - Triggers: manual / drowsiness reminder / auto after 24h inactivity
@@ -261,14 +261,14 @@ Memory import is being rebuilt and will return in a future version in a smarter 
 | `MEMORY_EXTRACT_INTERVAL` | Extract every N turns | `3` |
 | `CORS_ORIGINS` | Frontend origins, comma-separated | `http://localhost:5173` |
 | `JIEBA_CUSTOM_WORDS` | Custom jieba words, comma-separated | empty |
-| `CLEANUP_HEAT_THRESHOLD` | Low-heat cleanup threshold | `0.15` |
+| `CLEANUP_HEAT_THRESHOLD` | Low-heat non-destructive archive threshold | `0.15` |
 | `AUTO_SOFTEN_ENABLED` | Enable automatic softening | `true` |
 | `AUTO_SOFTEN_DAILY_LIMIT` | Daily softening limit | `10` |
 | `AUTO_SOFTEN_MIN_AGE` | Minimum age before softening, in days | `5` |
 | `SOFTEN_COOLDOWN_DAYS` | Softening cooldown, in days | `21` |
 | `LOCK_RETIRE_ENABLED` | Enable auto / Dream lock retirement | `true` |
 | `LOCK_RETIRE_DAYS` | Lock retirement age, in days | `90` |
-| `MERGE_RETENTION_DAYS` | Dream merge retention age, in days | `90` |
+| `MERGE_RETENTION_DAYS` | Days before a Dream merge enters cold archive | `90` |
 | `MERGE_MIN_KEEP` | Minimum Dream merge memories to keep | `20` |
 | `SCENE_INJECT_ENABLED` | Enable MemScene injection | `true` |
 | `SCENE_INJECT_LIMIT` | MemScenes injected per turn | `2` |
@@ -304,6 +304,8 @@ Memory import is being rebuilt and will return in a future version in a smarter 
 | `/debug/memories` | GET | List / search (`?q=`) |
 | `/debug/memories` | POST | Create |
 | `/debug/memories/{id}` | PUT / DELETE | Update / delete |
+| `/debug/memories/{id}/versions` | GET | Inspect immutable original and derived versions |
+| `/debug/memory-archive` | GET | Explicitly search cold archive and historical versions (`?q=`) |
 | `/debug/memories/{id}/toggle-permanent` | POST | Toggle lock |
 | `/debug/memories/batch-delete` | POST | Batch delete |
 | `/debug/memories/batch-update` | POST | Batch update |

@@ -86,9 +86,9 @@ CONFIG_SCHEMA = {
     "heat_importance_line":  ("",                        "8",    "重要度分界线",          "int"),
     "heat_emotion_line":     ("",                        "6",    "高情绪分界线",          "int"),
     "heat_medium_truncate":  ("",                        "60",   "中热度摘要截断字数",    "int"),
-    "cleanup_heat_threshold":("CLEANUP_HEAT_THRESHOLD", "0.15", "清理低热度阈值",    "float"),
-    "merge_retention_days":  ("MERGE_RETENTION_DAYS",  "90",   "合并记忆保留天数",  "int"),
-    "merge_min_keep":        ("MERGE_MIN_KEEP",        "20",   "合并记忆保留下限",  "int"),
+    "cleanup_heat_threshold":("CLEANUP_HEAT_THRESHOLD", "0.15", "低热度归档阈值",    "float"),
+    "merge_retention_days":  ("MERGE_RETENTION_DAYS",  "90",   "合并记忆冷归档天数", "int"),
+    "merge_min_keep":        ("MERGE_MIN_KEEP",        "20",   "合并记忆活跃保底",   "int"),
     # v5.4：记忆自动锁定
     "autolock_access_count": ("",                        "10",   "自动锁定：召回次数阈值",   "int"),
     "autolock_diversity":    ("",                        "5",    "自动锁定：话题多样性阈值", "int"),

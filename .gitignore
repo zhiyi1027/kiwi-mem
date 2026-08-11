@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 venv/
+.venv/
 .env
 
 # 你自己的人设和记忆（不要提交到公开仓库！）

@@ -140,6 +140,7 @@ async def _pool_execute(sql: str, *args: Any) -> str:
 async def _truncate(*tables: str) -> None:
     allowed = {
         "gateway_config",
+        "conversations",
         "memories",
         "chat_messages",
         "chat_conversations",
@@ -927,7 +928,7 @@ async def test_w1_01() -> None:
             f"project ids={[project_a, project_b]}, locked id={global_locked}"
         )
 
-    # 主清理候选：只能删除有日页面兜底的全局普通碎片。
+    # 主清理候选：全局普通碎片只能归档，任何行都不能物理删除。
     await _truncate("memories", "calendar_pages")
     old_at = StdDateTime.now(database.TZ_CST) - timedelta(days=40)
     await _pool_execute(
@@ -950,11 +951,24 @@ async def test_w1_01() -> None:
     remaining_cleanup = {
         row["id"] for row in await _pool_fetch("SELECT id FROM memories ORDER BY id")
     }
-    expected_cleanup = {cleanup_project_a, cleanup_project_b, cleanup_locked}
-    if remaining_cleanup != expected_cleanup or cleanup_global in remaining_cleanup:
+    expected_cleanup = {cleanup_global, cleanup_project_a, cleanup_project_b, cleanup_locked}
+    cleanup_global_state = await _pool_fetchrow(
+        "SELECT archived_at, archive_reason FROM memories WHERE id=$1", cleanup_global
+    )
+    protected_archives = await _pool_fetchval(
+        "SELECT COUNT(*) FROM memories WHERE id = ANY($1::int[]) AND archived_at IS NOT NULL",
+        [cleanup_project_a, cleanup_project_b, cleanup_locked],
+    )
+    if (
+        remaining_cleanup != expected_cleanup
+        or cleanup_global_state["archived_at"] is None
+        or not cleanup_global_state["archive_reason"]
+        or protected_archives != 0
+    ):
         issues.append(
-            "expired-fragment cleanup crossed project/lock boundary: "
-            f"expected remaining {sorted(expected_cleanup)}, got {sorted(remaining_cleanup)}"
+            "expired-fragment archive deleted data or crossed project/lock boundary: "
+            f"expected remaining {sorted(expected_cleanup)}, got {sorted(remaining_cleanup)}, "
+            f"global state={dict(cleanup_global_state)}, protected_archives={protected_archives}"
         )
 
     # dream_merge 的最小保留数只按全局 merge 计算；项目 merge 不能放大可删除额度。
@@ -983,10 +997,11 @@ async def test_w1_01() -> None:
         for index in range(4)
     }
     await daily_digest.cleanup_expired_fragments()
-    remaining_global_merges = {
+    active_global_merges = {
         row["id"]
         for row in await _pool_fetch(
-            "SELECT id FROM memories WHERE source='dream_merge' AND project_id IS NULL"
+            """SELECT id FROM memories
+               WHERE source='dream_merge' AND project_id IS NULL AND archived_at IS NULL"""
         )
     }
     remaining_project_merges = {
@@ -995,14 +1010,25 @@ async def test_w1_01() -> None:
             "SELECT id FROM memories WHERE source='dream_merge' AND project_id IS NOT NULL"
         )
     }
-    if len(remaining_global_merges) != 2 or remaining_project_merges != project_merges:
+    all_global_merges = {
+        row["id"]
+        for row in await _pool_fetch(
+            "SELECT id FROM memories WHERE source='dream_merge' AND project_id IS NULL"
+        )
+    }
+    if (
+        len(active_global_merges) != 2
+        or all_global_merges != global_merges
+        or remaining_project_merges != project_merges
+    ):
         issues.append(
-            "dream_merge retention counted or deleted project rows: "
-            f"global before={sorted(global_merges)}, global after={sorted(remaining_global_merges)}, "
+            "dream_merge retention deleted rows or crossed project scope: "
+            f"global before={sorted(global_merges)}, active after={sorted(active_global_merges)}, "
+            f"all after={sorted(all_global_merges)}, "
             f"project before={sorted(project_merges)}, project after={sorted(remaining_project_merges)}"
         )
 
-    # 两条 30 天硬删路径都只能触碰全局普通行；项目行和永久行必须保留。
+    # 原来的两条 30 天硬删路径现在只能补归档元数据，所有行都必须保留。
     await _truncate("memories", "calendar_pages")
     deleted_global = await _seed_memory(
         "deleted-global", memory_type="dream_deleted", created_at=old_at
@@ -1027,24 +1053,150 @@ async def test_w1_01() -> None:
     remaining_hard_delete = {
         row["id"] for row in await _pool_fetch("SELECT id FROM memories ORDER BY id")
     }
-    expected_hard_delete = {
+    expected_preserved = {
+        deleted_global,
         deleted_project,
         deleted_locked,
+        invalid_global,
         invalid_project,
         invalid_locked,
     }
-    if remaining_hard_delete != expected_hard_delete:
+    archived_global_count = await _pool_fetchval(
+        """SELECT COUNT(*) FROM memories
+           WHERE id = ANY($1::int[]) AND archived_at IS NOT NULL""",
+        [deleted_global, invalid_global],
+    )
+    protected_archived_count = await _pool_fetchval(
+        """SELECT COUNT(*) FROM memories
+           WHERE id = ANY($1::int[]) AND archived_at IS NOT NULL""",
+        [deleted_project, deleted_locked, invalid_project, invalid_locked],
+    )
+    if (
+        remaining_hard_delete != expected_preserved
+        or archived_global_count != 2
+        or protected_archived_count != 0
+    ):
         issues.append(
-            "30-day hard delete crossed project/lock boundary: "
-            f"expected remaining {sorted(expected_hard_delete)}, got {sorted(remaining_hard_delete)}; "
-            f"allowed deletions={[deleted_global, invalid_global]}"
+            "30-day archive physically deleted data or crossed project/lock boundary: "
+            f"expected remaining {sorted(expected_preserved)}, got {sorted(remaining_hard_delete)}; "
+            f"global archived={archived_global_count}, protected archived={protected_archived_count}"
         )
 
     require(not issues, " | ".join(issues))
     passed("T-W1-01-1 Dream candidates are global and non-permanent")
-    passed("T-W1-01-2 expired-fragment cleanup preserves projects and locks")
-    passed("T-W1-01-3 dream_merge retention counts only global rows")
-    passed("T-W1-01-4 hard-delete paths preserve projects and locks")
+    passed("T-W1-01-2 expired-fragment aging archives without deleting")
+    passed("T-W1-01-3 dream_merge retention archives and preserves every row")
+    passed("T-W1-01-4 former hard-delete paths only add archive metadata")
+
+
+async def test_continuity_profile(client: httpx.AsyncClient) -> None:
+    print("\nContinuity profile: immutable history and non-destructive regeneration")
+
+    await _truncate("memories", "conversations")
+
+    async def fake_embedding(text: str) -> list[float]:
+        checksum = float(sum(ord(char) for char in text) % 997) / 997.0
+        return [checksum, 1.0 - checksum]
+
+    original = "第一次一起看海时，她说风有一点凉。"
+    softened = "一起看海，风有些凉。"
+    corrected = "第一次一起看海时，她说风有一点凉，但心情很好。"
+
+    with patch.object(database, "get_embedding", fake_embedding):
+        memory_id = await database.save_memory(original, title="海边")
+        softened_ok = await database.soften_memory(
+            memory_id,
+            softened,
+            target_resolution=0.5,
+            extend_days=30,
+        )
+        updated_ok = await database.update_memory(memory_id, content=corrected)
+
+    require(softened_ok and updated_ok, "soften/update setup failed")
+    versions = await _pool_fetch(
+        """SELECT version, content, change_type
+           FROM memory_versions WHERE memory_id=$1 ORDER BY version""",
+        memory_id,
+    )
+    require(
+        [(row["version"], row["content"], row["change_type"]) for row in versions]
+        == [
+            (1, original, "original"),
+            (2, softened, "softened"),
+            (3, corrected, "manual_update"),
+        ],
+        f"memory version chain lost history: {[dict(row) for row in versions]}",
+    )
+    require(
+        await _pool_fetchval("SELECT content FROM memory_versions WHERE memory_id=$1 AND version=1", memory_id)
+        == original,
+        "immutable original was overwritten",
+    )
+    passed("T-CONT-1 softening and edits append versions; original remains immutable")
+
+    versions_response = await client.get(f"/debug/memories/{memory_id}/versions")
+    require(versions_response.status_code == 200, versions_response.text)
+    require(
+        [row["content"] for row in versions_response.json()["versions"]]
+        == [original, softened, corrected],
+        "version history endpoint lost a representation",
+    )
+    await _pool_execute("""
+        UPDATE memories
+        SET valid_until=NOW(), archived_at=NOW(), archive_reason='continuity_test'
+        WHERE id=$1
+    """, memory_id)
+    archive_response = await client.get(
+        "/debug/memory-archive", params={"q": softened, "limit": 10}
+    )
+    require(archive_response.status_code == 200, archive_response.text)
+    archived_results = archive_response.json()["memories"]
+    require(
+        archived_results and archived_results[0]["id"] == memory_id
+        and archived_results[0]["content"] == softened,
+        f"archived version is not explicitly searchable: {archived_results}",
+    )
+    passed("T-CONT-2 archived memories and earlier versions remain explicitly searchable")
+
+    await database.save_message("regen-session", "user", "给我两个答案", "test-model")
+    await database.save_message("regen-session", "assistant", "第一个答案", "test-model")
+    await database.delete_latest_assistant_message("regen-session")
+    await database.save_message("regen-session", "assistant", "重新生成的答案", "test-model")
+
+    raw_rows = await _pool_fetch(
+        """SELECT role, content, superseded_at
+           FROM conversations WHERE session_id='regen-session' ORDER BY id"""
+    )
+    active_rows = await database.get_recent_messages("regen-session", limit=10)
+    require(len(raw_rows) == 3, f"regeneration deleted raw transcript rows: {len(raw_rows)}")
+    require(raw_rows[1]["superseded_at"] is not None, "old reply was not marked superseded")
+    require(
+        [(row["role"], row["content"]) for row in active_rows]
+        == [("user", "给我两个答案"), ("assistant", "重新生成的答案")],
+        f"active transcript contains superseded reply: {active_rows}",
+    )
+    passed("T-CONT-3 regeneration preserves raw replies and filters superseded context")
+
+    cleanup_source = inspect.getsource(__import__("daily_digest").cleanup_expired_fragments)
+    regen_source = inspect.getsource(database.delete_latest_assistant_message)
+    require("DELETE FROM memories" not in cleanup_source, "automatic aging regained physical DELETE")
+    require("DELETE FROM conversations" not in regen_source, "regeneration regained physical DELETE")
+    passed("T-CONT-4 automatic aging and regeneration contain no physical DELETE")
+
+    response = await client.get("/sync/export")
+    require(response.status_code == 200, f"continuity backup export failed: {response.text}")
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        require("memory_versions.json" in archive.namelist(), "backup omitted memory_versions.json")
+        exported_versions = json.loads(archive.read("memory_versions.json"))
+        exported_memories = json.loads(archive.read("memories.json"))
+    original_exports = [
+        row for row in exported_versions
+        if row.get("memory_id") == memory_id and row.get("version") == 1
+    ]
+    exported_memory = next(row for row in exported_memories if row.get("id") == memory_id)
+    require(original_exports and original_exports[0]["content"] == original, "backup lost immutable original")
+    require("archived_at" in exported_memory and "archive_reason" in exported_memory, "backup lost archive state")
+    passed("T-CONT-5 backups include version history and archive metadata")
 
 
 async def run_suite(test_dsn: str) -> None:
@@ -1084,6 +1236,7 @@ async def run_suite(test_dsn: str) -> None:
         await test_s5(client)
         await test_s6(client)
         await test_w1_01()
+        await test_continuity_profile(client)
 
 
 async def async_main() -> int:
@@ -1095,8 +1248,10 @@ async def async_main() -> int:
         await run_suite(test_dsn)
         legacy_passed = [name for name in PASSED if name.startswith("T-S")]
         w1_01_passed = [name for name in PASSED if name.startswith("T-W1-01-")]
+        continuity_passed = [name for name in PASSED if name.startswith("T-CONT-")]
         print(f"\nPASS: {len(legacy_passed)} permanent S1-S6 behavior guards")
         print(f"PASS: {len(w1_01_passed)} W1-01 isolation/permanent guards")
+        print(f"PASS: {len(continuity_passed)} continuity/no-forgetting guards")
         print(f"PASS: {len(PASSED)} total permanent behavior guards")
         print("Real database path: disposable PostgreSQL verified")
         print("Real model/API path: not called; embedding/model/HTTP boundaries were mocked")

@@ -797,15 +797,16 @@ async def auto_soften_aging_memories(model_override: str = None):
 
 
 # ============================================================
-# 碎片过期清理 —— 普通碎片7天，重要碎片30天，锁定碎片永不删除
+# 碎片降温归档 —— 退出自动召回，但不删除任何记忆
 # ============================================================
 
 async def cleanup_expired_fragments():
     """
-    清理过期碎片记忆：
-    - is_permanent = true → 永不删除
-    - importance >= 8 → 保留30天
-    - 其他 → 保留7天
+    将低热度、已由上层摘要承接的碎片移出正常召回。
+
+    这是非破坏式操作：只写 valid_until / archived_at / archive_reason，
+    不允许自动任务对 memories 执行物理删除。原始行仍可供历史检索、
+    Dream 审计和显式恢复。
     """
     from database import get_pool, get_heat_params, calculate_heat
     from config import get_config_float, get_config_int
@@ -814,7 +815,7 @@ async def cleanup_expired_fragments():
     merge_retention_days = max(0, await get_config_int("merge_retention_days", 90))
     merge_min_keep = max(0, await get_config_int("merge_min_keep", 20))
     async with pool.acquire() as conn:
-        # 查出到期候选，删除前按热度再判定一次。
+        # 查出到期候选，归档前按热度再判定一次。
         # 安全检查：
         # 1. 该碎片所在日期已有日页面（日页面没生成的不删）
         # 2. 该碎片已被 Dream 处理过（Dream 还没看的不删）
@@ -826,6 +827,7 @@ async def cleanup_expired_fragments():
             FROM memories
             WHERE COALESCE(is_permanent, FALSE) = FALSE
               AND (valid_until IS NULL OR valid_until <= NOW())
+              AND archived_at IS NULL
               AND dream_processed_at IS NOT NULL
               AND project_id IS NULL
               AND (
@@ -852,13 +854,14 @@ async def cleanup_expired_fragments():
         merge_candidates = []
         merge_protected = 0
         merge_total = 0
-        to_delete = []
+        to_archive = []
         merge_total = await conn.fetchval("""
             SELECT COUNT(*)
             FROM memories
             WHERE source = 'dream_merge'
               AND COALESCE(is_permanent, FALSE) = FALSE
               AND project_id IS NULL
+              AND archived_at IS NULL
         """)
         merge_total = int(merge_total or 0)
         if candidates:
@@ -870,13 +873,13 @@ async def cleanup_expired_fragments():
                 access_count = r.get("access_count") or 0
                 if access_count == 0:
                     # 从未被召回的记忆按年龄直接清理，避免 calculate_heat 的冷启动保护让垃圾永远删不掉。
-                    should_delete = True
+                    should_archive = True
                     heat = 0.0
                 else:
                     heat = calculate_heat(r, heat_params)
-                    should_delete = heat < threshold
+                    should_archive = heat < threshold
 
-                if should_delete:
+                if should_archive:
                     if r.get("source") == "dream_merge":
                         merge_candidates.append({
                             "id": r["id"],
@@ -884,7 +887,7 @@ async def cleanup_expired_fragments():
                             "created_at": r.get("created_at"),
                         })
                     else:
-                        to_delete.append(r["id"])
+                        to_archive.append(r["id"])
                         if (r.get("importance") or 0) < 8:
                             count1 += 1
                         else:
@@ -900,43 +903,55 @@ async def cleanup_expired_fragments():
                 )
                 selected_merge = merge_candidates[:merge_allowed]
                 merge_ids = [item["id"] for item in selected_merge]
-                to_delete.extend(merge_ids)
+                to_archive.extend(merge_ids)
                 count_merge = len(merge_ids)
             merge_protected = max(0, len(merge_candidates) - count_merge)
 
-            if to_delete:
-                await conn.execute(
-                    "DELETE FROM memories WHERE id = ANY($1::int[])",
-                    to_delete
-                )
+            if to_archive:
+                await conn.execute("""
+                    UPDATE memories
+                    SET valid_until = COALESCE(valid_until, NOW()),
+                        archived_at = COALESCE(archived_at, NOW()),
+                        archive_reason = COALESCE(
+                            archive_reason,
+                            CASE
+                                WHEN source = 'dream_merge' THEN 'cold_dream_merge'
+                                WHEN importance < 8 THEN 'cold_fragment_7d'
+                                ELSE 'cold_fragment_30d'
+                            END
+                        )
+                    WHERE id = ANY($1::int[])
+                """, to_archive)
 
-        # 清理Dream已处理并标记删除的碎片（超过30天）
-        result3 = await conn.execute("""
-            DELETE FROM memories
+        # Dream 标记为移出召回的碎片，超过30天后补齐归档元数据。
+        rows3 = await conn.fetch("""
+            UPDATE memories
+            SET archived_at = COALESCE(archived_at, NOW()),
+                archive_reason = COALESCE(archive_reason, 'dream_archived'),
+                valid_until = COALESCE(valid_until, NOW())
             WHERE memory_type = 'dream_deleted'
               AND created_at < NOW() - INTERVAL '30 days'
               AND COALESCE(is_permanent, FALSE) = FALSE
               AND project_id IS NULL
+              AND archived_at IS NULL
+            RETURNING id
         """)
-        try:
-            count3 = int(result3.split()[-1]) if result3 else 0
-        except (ValueError, IndexError):
-            count3 = 0
+        count3 = len(rows3)
 
-        # v5.3：清理已失效且过期的碎片（valid_until 不为 NULL 且超过 30 天）
-        # 已被替代的旧记忆，保留 30 天供 Dream 查历史，之后彻底删除
-        result4 = await conn.execute("""
-            DELETE FROM memories
+        # 已被替代的旧记忆永久保留，只补齐归档原因。
+        rows4 = await conn.fetch("""
+            UPDATE memories
+            SET archived_at = COALESCE(archived_at, NOW()),
+                archive_reason = COALESCE(archive_reason, 'superseded_or_invalidated')
             WHERE valid_until IS NOT NULL
               AND valid_until < NOW() - INTERVAL '30 days'
               AND memory_type = 'fragment'
               AND COALESCE(is_permanent, FALSE) = FALSE
               AND project_id IS NULL
+              AND archived_at IS NULL
+            RETURNING id
         """)
-        try:
-            count4 = int(result4.split()[-1]) if result4 else 0
-        except (ValueError, IndexError):
-            count4 = 0
+        count4 = len(rows4)
 
     total = count1 + count2 + count_merge + count3 + count4
     if total > 0:
@@ -944,29 +959,36 @@ async def cleanup_expired_fragments():
         if count1: parts.append(f"{count1} 条普通碎片（>7天）")
         if count2: parts.append(f"{count2} 条重要碎片（>30天）")
         if count_merge: parts.append(f"{count_merge} 条dream_merge记忆")
-        if count3: parts.append(f"{count3} 条Dream已删碎片")
+        if count3: parts.append(f"{count3} 条Dream归档碎片")
         if count4: parts.append(f"{count4} 条已失效碎片（>30天）")
-        print(f"   🧹 清理了 {' + '.join(parts)}")
+        print(f"   🗄️ 非破坏式归档了 {' + '.join(parts)}")
     else:
-        print(f"   🧹 没有需要清理的碎片")
+        print(f"   🗄️ 没有需要归档的碎片")
 
     if merge_candidates or merge_total:
         print(
             f"   merge cleanup: candidates {len(merge_candidates)} / "
-            f"protected {merge_protected} / deleted {count_merge} "
+            f"protected {merge_protected} / archived {count_merge} "
             f"(inventory {merge_total}, min_keep {merge_min_keep})"
         )
 
     return {
-        "deleted_normal": count1,
-        "deleted_important": count2,
-        "deleted_merge": count_merge,
+        "archived_normal": count1,
+        "archived_important": count2,
+        "archived_merge": count_merge,
         "merge_candidates": len(merge_candidates),
         "merge_protected": merge_protected,
         "merge_total": merge_total,
-        "deleted_dream": count3,
-        "deleted_invalidated": count4,
-        "total": total,
+        "archived_dream": count3,
+        "archived_invalidated": count4,
+        "total_archived": total,
+        # Compatibility fields make the safety contract explicit to callers.
+        "deleted_normal": 0,
+        "deleted_important": 0,
+        "deleted_merge": 0,
+        "deleted_dream": 0,
+        "deleted_invalidated": 0,
+        "total": 0,
     }
 
 
