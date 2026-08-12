@@ -57,7 +57,15 @@ def main() -> None:
         "/reminders",
     ):
         require(is_control_plane_path(path), f"sensitive route is public: {path}")
-    for path in ("/admin", "/admin/", "/admin/js/app.js", "/memory/v1/recall", "/memory/mcp", "/calendar/mcp"):
+    for path in (
+        "/admin",
+        "/admin/",
+        "/admin/js/app.js",
+        "/admin/fonts/ibm-plex-mono-latin-400-normal.woff2",
+        "/memory/v1/recall",
+        "/memory/mcp",
+        "/calendar/mcp",
+    ):
         require(not is_control_plane_path(path), f"non-control route was accidentally gated: {path}")
     for path in ("/v1/chat/completions", "/memory/mcp", "/calendar/mcp"):
         require(is_shared_identity_entry_path(path), f"shared identity transport is public: {path}")

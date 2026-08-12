@@ -46,11 +46,15 @@ from database import (
     get_system_prompt_from_db, set_system_prompt_in_db,
     # v4.1 云端同步
     sync_get_conversations, sync_get_conversation, sync_upsert_conversation, sync_delete_conversation,
-    sync_upsert_messages, sync_get_projects, sync_upsert_project, sync_delete_project, sync_import_all,
+    sync_create_conversation, sync_patch_conversation,
+    sync_upsert_messages, sync_upsert_single_message, sync_delete_message,
+    sync_get_projects, sync_upsert_project, sync_create_project, sync_patch_project,
+    sync_delete_project, sync_import_all,
     # v4.2 提醒系统
     create_reminder, get_reminders, update_reminder, delete_reminder, get_due_reminders, fire_reminder,
 )
 from config import (
+    REASONING_EFFORT_VALUES,
     SYNC_SETTING_KEYS,
     get_all_config, set_config, get_config, get_config_int, get_config_bool, get_config_float,
 )
@@ -84,6 +88,10 @@ from access_control import (
 # ============================================================
 # 配置项 —— 全部从环境变量读取，部署时在云平台面板里设置
 # ============================================================
+
+# 版本号。管理面板顶栏/侧栏读 GET / 的 version 字段显示，
+# 只此一处定义，避免两处字符串各说各话。
+VERSION = "1.6.2"
 
 # 你的 API Key（OpenRouter / OpenAI / 其他兼容服务）
 API_KEY = os.getenv("API_KEY", "")
@@ -1926,8 +1934,8 @@ async def root_status():
             pass
     return {
         "status": "running",
-        "gateway": "Kiwi-Mem v1.3.0",
-        "version": "Kiwi-Mem v1.3.0",
+        "gateway": f"Kiwi-Mem v{VERSION}",
+        "version": f"Kiwi-Mem v{VERSION}",
         "memory_enabled": mem_enabled,
         "memory_count": memory_count,
         # 前端 admin-panel 读 status.memories, 加别名避免显示 '-'
@@ -1966,6 +1974,14 @@ async def api_status():
     return await root_status()
 
 
+# 管理面板资源的缓存策略。no-cache = 浏览器可以留副本，但每次用之前
+# 必须带 ETag 回来问一句；没变服务端回 304, 变了就拿新的。
+# 详见文件末尾 _PanelStaticFiles 的说明。
+PANEL_CACHE_CONTROL = "no-cache, must-revalidate"
+# 自带字体是不可变资源（要换就换文件名），给一年强缓存。
+PANEL_FONT_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+
 @app.get("/admin")
 async def admin_panel():
     """返回管理面板 HTML（admin-panel/index.html）。
@@ -1976,7 +1992,11 @@ async def admin_panel():
     from fastapi.responses import FileResponse
     panel_path = os.path.join(os.path.dirname(__file__), "admin-panel", "index.html")
     if os.path.exists(panel_path):
-        return FileResponse(panel_path, media_type="text/html; charset=utf-8")
+        return FileResponse(
+            panel_path,
+            media_type="text/html; charset=utf-8",
+            headers={"Cache-Control": PANEL_CACHE_CONTROL},
+        )
     return {"status": "running", "service": "kiwi-mem", "warning": "admin-panel/index.html not found"}
 
 
@@ -2162,6 +2182,26 @@ async def extract_file_content(file: UploadFile = File(...)):
         )
 
 
+def _normalize_reasoning_effort(value):
+    """Normalize the public five-value request contract or reject it explicitly."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(
+            "reasoning_effort 必须是 "
+            + "/".join(REASONING_EFFORT_VALUES)
+            + " 之一"
+        )
+    normalized = value.strip().lower()
+    if normalized not in REASONING_EFFORT_VALUES:
+        raise ValueError(
+            "reasoning_effort 必须是 "
+            + "/".join(REASONING_EFFORT_VALUES)
+            + f" 之一，收到 {value[:40]!r}"
+        )
+    return normalized
+
+
 def _apply_reasoning(body: dict, is_openrouter: bool, is_anthropic_fmt: bool, reasoning_effort, skip_prompt: bool = False):
     """统一决定一个出站请求体的思考链参数。转发路径与工具循环共用，保证两条路对所有供应商一致。
 
@@ -2170,8 +2210,9 @@ def _apply_reasoning(body: dict, is_openrouter: bool, is_anthropic_fmt: bool, re
       - OpenRouter / Anthropic 直连 → 写 reasoning={"enabled":True[, "effort"]}
           None（旧前端 / 非推理模型未发）视为默认开（向后兼容）；'auto' 开但不带 effort；
           'low'/'medium'/'high' 带 effort。
-      - 其它 OpenAI 兼容供应商 → 只透传合法 effort(low/medium/high)；off/auto/未知值剥掉，
+      - 其它 OpenAI 兼容供应商 → 只透传合法 effort(low/medium/high)；off/auto 剥掉，
           避免严格供应商（如直连 OpenAI o 系列）对非法 reasoning_effort 报 400。
+    未知值在 /v1 入口由 _normalize_reasoning_effort 明确拒绝，不会静默进入本函数。
     """
     # 先清干净，避免 fresh body 残留或重复调用叠加
     body.pop("reasoning", None)
@@ -2232,6 +2273,20 @@ async def chat_completions(request: Request):
     # API_KEY 检查移到供应商路由的 else 分支：只有「既没匹配到供应商、又没有环境变量
     # API_KEY」时才报 500。否则面板里配了供应商、但 env API_KEY 留空的用户会被误拦。
     body = await request.json()
+    try:
+        reasoning_effort = _normalize_reasoning_effort(body.pop("reasoning_effort", None))
+    except ValueError as e:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": str(e),
+                    "type": "invalid_request_error",
+                    "param": "reasoning_effort",
+                    "code": "invalid_value",
+                }
+            },
+        )
     messages = body.get("messages", [])
     archive_received_at = datetime.now(timezone.utc)
     archive_idempotency_key = str(request.headers.get("idempotency-key") or "").strip()
@@ -2574,7 +2629,6 @@ async def chat_completions(request: Request):
     
     # 思考链参数：统一交给 _apply_reasoning 处理（转发路径与工具循环同一套规则，对各类供应商分流）。
     # 由 to_anthropic_request 把 reasoning.enabled 转成 Anthropic extended thinking。
-    reasoning_effort = body.pop("reasoning_effort", None)
     _apply_reasoning(body, is_openrouter, is_anthropic_fmt, reasoning_effort, skip_prompt)
     
     # ---------- Prompt 缓存（v5.5 → v5.7 修正）----------
@@ -2622,6 +2676,8 @@ async def chat_completions(request: Request):
             await _drawer_init()
         except Exception as e:
             print(f"⚠️ 工具抽屉 lazy init 失败: {e}")
+        drawer_tools = []
+        drawer_map = {}
         try:
             from tool_drawer import route_tools as _drawer_route
             user_embedding = prompt_meta.get("user_embedding") if prompt_meta else None
@@ -2635,10 +2691,33 @@ async def chat_completions(request: Request):
                 mcp_mode=mcp_mode,
                 reminder_tools_enabled=reminder_tools_enabled,
             )
-            openai_tools.extend(drawer_tools)
-            tool_map.update(drawer_map)
         except Exception as e:
             print(f"❌ 工具抽屉路由失败: {e}")
+        if drawer_tools and drawer_map:
+            openai_tools.extend(drawer_tools)
+            tool_map.update(drawer_map)
+        else:
+            print("⚠️ 工具抽屉路由无可用结果，启用受门控的全量降级")
+            try:
+                from tool_drawer import build_full_fallback_tools, _get_pinned_external_categories
+                pinned_external = (
+                    await _get_pinned_external_categories()
+                    if mcp_mode == "manual"
+                    else set()
+                )
+                fallback_tools, fallback_map = build_full_fallback_tools(
+                    search_enabled=bool(do_search_auto),
+                    mem_enabled=mem_enabled,
+                    reminder_tools_enabled=reminder_tools_enabled,
+                    mcp_mode=mcp_mode,
+                    pinned_external=pinned_external,
+                    project_id=project_id,
+                )
+                openai_tools.extend(fallback_tools)
+                tool_map.update(fallback_map)
+                print(f"🗃️  全量降级：装载了 {len(fallback_tools)} 个受门控工具")
+            except Exception as fallback_e:
+                print(f"❌ 工具抽屉全量降级失败: {fallback_e}")
         # Request-body MCP servers are explicit third-party input and bypass mcp_mode by design.
         if mcp_servers:
             try:
@@ -3627,6 +3706,42 @@ async def _finalize_stream_memories(mem_enabled, session_id, user_message, assis
         )
     return None
 
+def _capture_openai_sse_event(event: str, full_response: list) -> tuple[int, dict | None]:
+    """Capture assistant text from one complete OpenAI-compatible SSE event.
+
+    This helper is intentionally pure apart from appending to the request-local
+    ``full_response`` list.  In particular it never writes to the database or
+    starts extraction work.  Usage-only events are left untouched for downstream
+    forwarding and do not become assistant text.
+    """
+    reasoning_chunks = 0
+    first_delta = None
+
+    for line in event.split("\n"):
+        line = line.strip()
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        try:
+            data = json.loads(line[6:])
+            choices = data.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            if not isinstance(delta, dict):
+                continue
+            if first_delta is None and delta:
+                first_delta = delta
+            if delta.get("reasoning_content") or delta.get("reasoning") or delta.get("reasoning_details"):
+                reasoning_chunks += 1
+            content = delta.get("content", "")
+            if isinstance(content, str) and content:
+                full_response.append(content)
+        except (json.JSONDecodeError, AttributeError, KeyError, IndexError, TypeError):
+            continue
+
+    return reasoning_chunks, first_delta
+
+
 async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, tool_events: list = None, api_url: str = None, project_id: str = None, prompt_meta: dict = None, api_format: str = "openai", api_key: str = None, is_regenerate: bool = False, mem_enabled: bool = True, archive_context=None):
     """流式响应 + 捕获完整回复 + 工具事件"""
     _api_url = api_url or API_BASE_URL
@@ -3704,28 +3819,25 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                             event = event.strip()
                             if not event or event == "data: [DONE]":
                                 continue
+                            captured_reasoning, _ = _capture_openai_sse_event(event, full_response)
+                            _reasoning_chunks += captured_reasoning
                             yield (event + "\n\n").encode("utf-8")
-                            try:
-                                for line in event.split("\n"):
-                                    line = line.strip()
-                                    if line.startswith("data: "):
-                                        data = json.loads(line[6:])
-                                        delta = data.get("choices", [{}])[0].get("delta", {})
-                                        content = delta.get("content", "")
-                                        if content:
-                                            full_response.append(content)
-                                        if delta.get("reasoning_content"):
-                                            _reasoning_chunks += 1
-                            except Exception:
-                                pass
                     _tail = _ev_buf.strip()
                     if _tail and _tail != "data: [DONE]":
+                        captured_reasoning, _ = _capture_openai_sse_event(_tail, full_response)
+                        _reasoning_chunks += captured_reasoning
                         yield (_tail + "\n\n").encode("utf-8")
         else:
             # OpenAI 格式：直接转发
             buffer = ""
+            stream_headers = {
+                key: value
+                for key, value in (headers or {}).items()
+                if key.lower() != "accept-encoding"
+            }
+            stream_headers["Accept-Encoding"] = "identity"
             async with httpx.AsyncClient(timeout=300) as client:
-                async with client.stream("POST", _api_url, headers=headers, json=body) as response:
+                async with client.stream("POST", _api_url, headers=stream_headers, json=body) as response:
                     if response.status_code != 200:
                         error_body = b""
                         async for chunk in response.aiter_bytes():
@@ -3746,36 +3858,25 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
                             event = event.strip()
                             if not event or event == "data: [DONE]":
                                 continue
+                            captured_reasoning, first_delta = _capture_openai_sse_event(event, full_response)
+                            _reasoning_chunks += captured_reasoning
+
+                            # 🔍 调试日志：记录第一个有效delta的所有字段
+                            if not _logged_first_delta and first_delta:
+                                keys = list(first_delta.keys())
+                                if keys and keys != ['role']:
+                                    print(f"🔍 [流式调试] 首个delta字段: {keys}, 模型: {model}")
+                                    for k in ('reasoning_content', 'reasoning', 'reasoning_details'):
+                                        if k in first_delta:
+                                            sample = str(first_delta[k])[:100]
+                                            print(f"🔍 [流式调试] {k} 示例: {sample}")
+                                    _logged_first_delta = True
+
                             yield (event + "\n\n").encode("utf-8")
-                            for line in event.split("\n"):
-                                line = line.strip()
-                                if not line.startswith("data: "):
-                                    continue
-                                try:
-                                    data = json.loads(line[6:])
-                                    delta = data.get("choices", [{}])[0].get("delta", {})
-
-                                    # 🔍 调试日志：记录第一个有效delta的所有字段
-                                    if not _logged_first_delta and delta:
-                                        keys = list(delta.keys())
-                                        if keys and keys != ['role']:
-                                            print(f"🔍 [流式调试] 首个delta字段: {keys}, 模型: {model}")
-                                            for k in ('reasoning_content', 'reasoning', 'reasoning_details'):
-                                                if k in delta:
-                                                    sample = str(delta[k])[:100]
-                                                    print(f"🔍 [流式调试] {k} 示例: {sample}")
-                                            _logged_first_delta = True
-
-                                    if delta.get('reasoning_content') or delta.get('reasoning') or delta.get('reasoning_details'):
-                                        _reasoning_chunks += 1
-
-                                    content = delta.get("content", "")
-                                    if content:
-                                        full_response.append(content)
-                                except (json.JSONDecodeError, KeyError, IndexError):
-                                    pass
                     _tail = buffer.strip()
                     if _tail and _tail != "data: [DONE]":
+                        captured_reasoning, _ = _capture_openai_sse_event(_tail, full_response)
+                        _reasoning_chunks += captured_reasoning
                         yield (_tail + "\n\n").encode("utf-8")
     finally:
         # 断连（取消/GeneratorExit）或正常完成都在此把收尾 task 与 Dream 兜底同步补出生。
@@ -4351,10 +4452,13 @@ async def api_generate_day_page(date: str = None):
 
 @app.get("/admin/week-summary")
 async def api_generate_week_summary(start: str = None, end: str = None):
-    """手动触发周总结 ?start=2026-03-31&end=2026-04-06"""
+    """手动触发周总结 ?start=2026-03-30&end=2026-04-05"""
     try:
+        from calendar_periods import validate_calendar_period_identity
         from daily_digest import generate_week_summary
-        if not start or not end:
+        if (start is None) != (end is None):
+            return JSONResponse(status_code=400, content={"error": "start 与 end 必须同时提供或同时省略"})
+        if start is None and end is None:
             from datetime import timedelta as td, timezone as tz_mod, datetime as dt_cls
             TZ = tz_mod(td(hours=8))
             now = dt_cls.now(TZ)
@@ -4364,8 +4468,11 @@ async def api_generate_week_summary(start: str = None, end: str = None):
             last_sunday = last_monday + td(days=6)
             start = last_monday.strftime("%Y-%m-%d")
             end = last_sunday.strftime("%Y-%m-%d")
+        validate_calendar_period_identity(start, "week", end_value=end)
         result = await generate_week_summary(start, end)
         return {"status": "ok", **result}
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
     except Exception as e:
         return {"error": str(e)}
 
@@ -4374,6 +4481,7 @@ async def api_generate_week_summary(start: str = None, end: str = None):
 async def api_generate_month_summary(month: str = None):
     """手动触发月总结 ?month=2026-03"""
     try:
+        from calendar_periods import validate_calendar_period_identity
         from daily_digest import generate_month_summary
         if not month:
             from datetime import timedelta as td, timezone as tz_mod, datetime as dt_cls
@@ -4387,8 +4495,11 @@ async def api_generate_month_summary(month: str = None):
         last_day = cal_mod.monthrange(int(year), int(mon))[1]
         start = f"{month}-01"
         end = f"{month}-{last_day:02d}"
+        validate_calendar_period_identity(start, "month", end_value=end)
         result = await generate_month_summary(start, end, month)
         return {"status": "ok", **result}
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
     except Exception as e:
         return {"error": str(e)}
 
@@ -4397,6 +4508,7 @@ async def api_generate_month_summary(month: str = None):
 async def api_generate_quarter_summary(quarter: str = None):
     """手动触发季度总结 ?quarter=2026-Q1"""
     try:
+        from calendar_periods import validate_calendar_period_identity
         from daily_digest import generate_period_summary
         import calendar as cal_mod
         from datetime import timedelta as td, timezone as tz_mod, datetime as dt_cls
@@ -4426,8 +4538,11 @@ async def api_generate_quarter_summary(quarter: str = None):
         end = f"{year}-{q_end_month:02d}-{q_end_day:02d}"
         label = f"{year}Q{q}"
 
+        validate_calendar_period_identity(start, "quarter", end_value=end)
         result = await generate_period_summary(start, end, "quarter", label, "月总结")
         return {"status": "ok", **result}
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
     except Exception as e:
         return {"error": str(e)}
 
@@ -4436,6 +4551,7 @@ async def api_generate_quarter_summary(quarter: str = None):
 async def api_generate_year_summary(year: str = None):
     """手动触发年度总结 ?year=2025"""
     try:
+        from calendar_periods import validate_calendar_period_identity
         from daily_digest import generate_period_summary
         from datetime import timedelta as td, timezone as tz_mod, datetime as dt_cls
 
@@ -4448,8 +4564,11 @@ async def api_generate_year_summary(year: str = None):
         start = f"{y}-01-01"
         end = f"{y}-12-31"
 
+        validate_calendar_period_identity(start, "year", end_value=end)
         result = await generate_period_summary(start, end, "year", str(y), "季度总结")
         return {"status": "ok", **result}
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
     except Exception as e:
         return {"error": str(e)}
 
@@ -4553,15 +4672,28 @@ async def api_get_calendar_range(start: str = None, end: str = None, type: str =
         return {"error": str(e)}
 
 
+@app.get("/admin/calendar-period-audit")
+async def api_calendar_period_audit():
+    """只读列出存量非法周期页；隔离不等于迁移或删除。"""
+    try:
+        from database import get_invalid_calendar_period_pages
+        pages = await get_invalid_calendar_period_pages()
+        return {"status": "ok", "pages": pages, "count": len(pages)}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.put("/admin/calendar/{date}")
 async def api_save_calendar_page(date: str, req: Request):
     """用户手动编辑/创建日历页面"""
     try:
+        from calendar_periods import validate_calendar_period_identity
         from database import update_calendar_page_user_edit
         body = await req.json()
         content = body.get("content", "")
         title = body.get("title", "")
         page_type = body.get("type", "day")
+        validate_calendar_period_identity(date, page_type)
         # 用户编辑只写 diary（content）与 title；页面已有的 AI 内容
         # （sections/keywords/summary/digest/model_used）一律保留，不再被空值覆盖。
         page_id = await update_calendar_page_user_edit(
@@ -4571,6 +4703,8 @@ async def api_save_calendar_page(date: str, req: Request):
             title=title,
         )
         return {"status": "ok", "id": page_id}
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
     except Exception as e:
         return {"error": str(e)}
 
@@ -4861,6 +4995,30 @@ async def api_set_config(key: str, request: Request):
 # 无缝换窗 v2：源对话概要压缩（同步调用）
 # ============================================================
 
+async def _render_compress_prompt(template: str) -> str:
+    """Replace public compression placeholders with configured or safe values."""
+    ratio = 0.35
+    output_max = 4000
+    try:
+        configured_ratio = await get_config_float("compress_ratio", fallback=ratio)
+        if math.isfinite(configured_ratio) and configured_ratio > 0:
+            ratio = configured_ratio
+    except Exception:
+        pass
+    try:
+        configured_output_max = await get_config_int("compress_output_max", fallback=output_max)
+        if configured_output_max > 0:
+            output_max = configured_output_max
+    except Exception:
+        pass
+
+    return (
+        str(template or "")
+        .replace("{compress_ratio}", f"{round(ratio * 100)}%")
+        .replace("{compress_output_max}", f"{output_max} token")
+    )
+
+
 async def _compress_for_handoff(existing_summary: str, messages: list):
     """把源对话的（已有概要 + 待压消息）同步压成一段概要，失败返回 None。
 
@@ -4891,6 +5049,7 @@ async def _compress_for_handoff(existing_summary: str, messages: list):
         "请将以下对话内容压缩为简洁的摘要，保留关键信息、话题走向和情感基调。"
         "不要截断正在进行中的话题。"
     )
+    compress_prompt = await _render_compress_prompt(compress_prompt)
 
     try:
         from database import resolve_model_endpoint
@@ -5700,6 +5859,26 @@ async def api_search_messages(q: str = "", project_id: str = None, limit: int = 
 # 云端同步 API（v4.1）
 # ============================================================
 
+async def _read_json_object(request: Request):
+    """解析 JSON 对象；非法 JSON 或非对象请求统一返回 400。"""
+    try:
+        data = await request.json()
+    except Exception:
+        return None, JSONResponse(status_code=400, content={"error": "请求体必须是合法 JSON"})
+    if not isinstance(data, dict):
+        return None, JSONResponse(status_code=400, content={"error": "请求体必须是 JSON 对象"})
+    return data, None
+
+
+async def _legacy_write_gate(endpoint: str):
+    """记录无 payload 的调用计数事件；关闸时返回 410，默认保持旧 PUT 可用。"""
+    allowed = await get_config_bool("sync_legacy_write_enabled", fallback=True)
+    outcome = "allowed" if allowed else "blocked"
+    print(f"event=sync_legacy_write endpoint={endpoint} outcome={outcome} increment=1")
+    if not allowed:
+        return JSONResponse(status_code=410, content={"error": "旧同步通道已退役，请更新客户端"})
+    return None
+
 # ──── 对话 ────
 
 @app.get("/sync/conversations")
@@ -5725,10 +5904,34 @@ async def api_sync_get_conversation(conv_id: str):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@app.post("/sync/conversations")
+async def api_sync_create_conversation(request: Request):
+    """创建对话元数据；已存在返回 409，消息须经单消息端点写入。"""
+    try:
+        data, err = await _read_json_object(request)
+        if err:
+            return err
+        warning = "messages ignored" if "messages" in data else None
+        data.pop("messages", None)
+        if not str(data.get("id") or "").strip():
+            return JSONResponse(status_code=400, content={"error": "缺少对话 id"})
+        if not await sync_create_conversation(data):
+            return JSONResponse(status_code=409, content={"error": "对话已存在"})
+        result = {"status": "ok"}
+        if warning:
+            result["warning"] = warning
+        return result
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.put("/sync/conversations/{conv_id}")
 async def api_sync_upsert_conversation(conv_id: str, request: Request):
-    """创建或更新对话（含消息）"""
+    """创建或更新对话（含消息）的旧全量通道。"""
     try:
+        gate = await _legacy_write_gate("conversation_put")
+        if gate:
+            return gate
         data = await request.json()
         data["id"] = conv_id
         messages = data.pop("messages", None)
@@ -5740,12 +5943,58 @@ async def api_sync_upsert_conversation(conv_id: str, request: Request):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@app.patch("/sync/conversations/{conv_id}")
+async def api_sync_patch_conversation(conv_id: str, request: Request):
+    """局部更新对话元数据；空 PATCH 400，不存在 404。"""
+    try:
+        data, err = await _read_json_object(request)
+        if err:
+            return err
+        data.pop("messages", None)
+        status = await sync_patch_conversation(conv_id, data)
+        if status == "no_fields":
+            return JSONResponse(status_code=400, content={"error": "没有可更新的字段"})
+        if status == "not_found":
+            return JSONResponse(status_code=404, content={"error": "对话不存在"})
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.delete("/sync/conversations/{conv_id}")
 async def api_sync_delete_conversation(conv_id: str):
     """删除对话"""
     try:
         deleted = await sync_delete_conversation(conv_id)
         return {"deleted": deleted}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# ──── 单消息 ────
+
+@app.put("/sync/conversations/{conv_id}/messages/{msg_id}")
+async def api_sync_upsert_message(conv_id: str, msg_id: str, request: Request):
+    """按 URL 权威 ID upsert 单条完整消息快照。"""
+    try:
+        if not msg_id or not msg_id.strip():
+            return JSONResponse(status_code=400, content={"error": "msg_id 不能为空"})
+        data, err = await _read_json_object(request)
+        if err:
+            return err
+        status, code = await sync_upsert_single_message(conv_id, msg_id, data)
+        if code != 200:
+            return JSONResponse(status_code=code, content={"error": status})
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.delete("/sync/conversations/{conv_id}/messages/{msg_id}")
+async def api_sync_delete_message(conv_id: str, msg_id: str):
+    """以对话和消息双条件删除单条消息。"""
+    try:
+        return {"deleted": await sync_delete_message(conv_id, msg_id)}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
@@ -5762,13 +6011,49 @@ async def api_sync_get_projects():
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@app.post("/sync/projects")
+async def api_sync_create_project(request: Request):
+    """创建项目；已存在返回 409。"""
+    try:
+        data, err = await _read_json_object(request)
+        if err:
+            return err
+        if not str(data.get("id") or "").strip():
+            return JSONResponse(status_code=400, content={"error": "缺少项目 id"})
+        if not await sync_create_project(data):
+            return JSONResponse(status_code=409, content={"error": "项目已存在"})
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.put("/sync/projects/{proj_id}")
 async def api_sync_upsert_project(proj_id: str, request: Request):
-    """创建或更新项目"""
+    """创建或更新项目的旧全量通道。"""
     try:
+        gate = await _legacy_write_gate("project_put")
+        if gate:
+            return gate
         data = await request.json()
         data["id"] = proj_id
         await sync_upsert_project(data)
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.patch("/sync/projects/{proj_id}")
+async def api_sync_patch_project(proj_id: str, request: Request):
+    """局部更新项目；空 PATCH 400，不存在 404。"""
+    try:
+        data, err = await _read_json_object(request)
+        if err:
+            return err
+        status = await sync_patch_project(proj_id, data)
+        if status == "no_fields":
+            return JSONResponse(status_code=400, content={"error": "没有可更新的字段"})
+        if status == "not_found":
+            return JSONResponse(status_code=404, content={"error": "项目不存在"})
         return {"status": "ok"}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -6306,9 +6591,40 @@ app.mount("/calendar", get_calendar_mcp_app())
 # /admin 返回 index.html（上面的 @app.get("/admin")），/admin/ 由 html=True 提供；
 # 页面内用绝对路径 /admin/... 引用资源。
 from fastapi.staticfiles import StaticFiles as _StaticFiles
+
+
+class _PanelStaticFiles(_StaticFiles):
+    """管理面板静态资源：一律带 no-cache, 让浏览器每次都回来问一句。
+
+    StaticFiles 默认只发 ETag / Last-Modified, 不发 Cache-Control。缺了
+    Cache-Control 时浏览器可以按启发式规则自行判定新鲜度（常见实现取
+    「距上次修改时间」的 10% 当有效期）——一个几个月没动过的 style.css,
+    浏览器能自作主张缓存好几天，期间连一次条件请求都不发。
+    结果就是升级面板后换了文件、重启了服务，页面看上去还是老样子。
+
+    面板的 js/pages/*.js 是 app.js 动态 import 进来的，URL 上没法挂
+    ?v=版本号，所以只能在服务端统一声明。no-cache 不等于不缓存：浏览器
+    仍然存副本，只是每次先带 ETag 问一下，没变就回 304（几十字节），
+    变了才重新下载。代价极小，换来的是「换了文件就一定看得到」。
+
+    例外是 fonts/ 下自带的字体文件：它们不会被就地改内容（换字体等于换
+    文件名），没有「改了看不到」的问题，所以给一年强缓存，省掉每次打开
+    面板都要为字体发几个条件请求。
+    """
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        path = str(args[0] if args else kwargs.get("full_path", ""))
+        if os.sep + "fonts" + os.sep in path:
+            response.headers["Cache-Control"] = PANEL_FONT_CACHE_CONTROL
+        else:
+            response.headers["Cache-Control"] = PANEL_CACHE_CONTROL
+        return response
+
+
 _panel_dir = os.path.join(os.path.dirname(__file__), "admin-panel")
 if os.path.isdir(_panel_dir):
-    app.mount("/admin", _StaticFiles(directory=_panel_dir, html=True), name="admin-panel")
+    app.mount("/admin", _PanelStaticFiles(directory=_panel_dir, html=True), name="admin-panel")
 
 
 # ============================================================

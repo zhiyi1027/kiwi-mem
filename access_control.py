@@ -74,7 +74,12 @@ _CONTROL_PREFIXES = (
     "/projects",
 )
 _PUBLIC_ADMIN_PATHS = ("/admin", "/admin/")
-_PUBLIC_ADMIN_ASSET_PREFIXES = ("/admin/css/", "/admin/js/", "/admin/assets/")
+_PUBLIC_ADMIN_ASSET_PREFIXES = (
+    "/admin/css/",
+    "/admin/js/",
+    "/admin/assets/",
+    "/admin/fonts/",
+)
 _SHARED_IDENTITY_ENTRY_PATHS = (
     "/v1/chat/completions",
     "/memory/mcp",

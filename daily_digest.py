@@ -1069,6 +1069,234 @@ DAY_PAGE_PROMPT = """你是用户的 AI 伴侣。请根据今天的完整聊天�
 {conversations}"""
 
 
+def _strip_json_wrapping(text: str) -> str:
+    """Remove the common Markdown fence around a model JSON response."""
+    value = (text or "").strip()
+    if value.startswith("```json"):
+        value = value[7:]
+    elif value.startswith("```"):
+        value = value[3:]
+    if value.endswith("```"):
+        value = value[:-3]
+    return value.strip()
+
+
+def _iter_json_object_candidates(text: str):
+    """Yield balanced JSON-object slices without a greedy cross-object match."""
+    start = None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if start is None:
+            if char == "{":
+                start = index
+                depth = 1
+                in_string = False
+                escaped = False
+            continue
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                yield text[start:index + 1]
+                start = None
+
+
+def _next_nonspace_index(text: str, start: int) -> int:
+    index = start
+    while index < len(text) and text[index].isspace():
+        index += 1
+    return index
+
+
+def _quote_is_structural(
+    text: str,
+    quote_index: int,
+    container: str = None,
+    string_is_key: bool = False,
+) -> bool:
+    """Return whether a quote looks like a JSON key/value closing quote."""
+    index = _next_nonspace_index(text, quote_index + 1)
+    if string_is_key:
+        return index < len(text) and text[index] == ":"
+    if index >= len(text):
+        return container is None
+    if container == "{":
+        if text[index] == "}":
+            return True
+        if text[index] != ",":
+            return False
+        index = _next_nonspace_index(text, index + 1)
+        return index < len(text) and text[index] == '"'
+    if container == "[":
+        if text[index] == "]":
+            return True
+        if text[index] != ",":
+            return False
+        index = _next_nonspace_index(text, index + 1)
+        if index >= len(text):
+            return False
+        return (
+            text[index] in '"{['
+            or text[index].isdigit()
+            or text[index] == "-"
+            or text.startswith("true", index)
+            or text.startswith("false", index)
+            or text.startswith("null", index)
+        )
+    return False
+
+
+def _escape_unescaped_json_content_quotes(text: str) -> str:
+    """Conservatively escape bare quotes inside JSON string content."""
+    output = []
+    containers = []
+    last_significant = None
+    in_string = False
+    escaped = False
+    string_container = None
+    string_is_key = False
+    for index, char in enumerate(text):
+        if not in_string:
+            if char == '"':
+                string_container = containers[-1] if containers else None
+                string_is_key = string_container == "{" and last_significant in ("{", ",")
+                in_string = True
+            elif char in "{[":
+                containers.append(char)
+            elif char == "}" and containers and containers[-1] == "{":
+                containers.pop()
+            elif char == "]" and containers and containers[-1] == "[":
+                containers.pop()
+            output.append(char)
+            if not char.isspace():
+                last_significant = char
+            continue
+
+        if escaped:
+            output.append(char)
+            escaped = False
+        elif char == "\\":
+            output.append(char)
+            escaped = True
+        elif char != '"':
+            output.append(char)
+        elif _quote_is_structural(text, index, string_container, string_is_key):
+            in_string = False
+            output.append(char)
+            last_significant = char
+        else:
+            output.append('\\"')
+    return "".join(output)
+
+
+def _has_safe_json_keys(value, *, root: bool = True) -> bool:
+    """Reject malformed keys that may have been invented by quote repair."""
+    if isinstance(value, dict):
+        if root and not value:
+            return False
+        for key, child in value.items():
+            if (
+                not isinstance(key, str)
+                or not key
+                or len(key) > 64
+                or not all(char.isascii() and (char.isalnum() or char in "_-") for char in key)
+            ):
+                return False
+            if not _has_safe_json_keys(child, root=False):
+                return False
+    elif isinstance(value, list):
+        return all(_has_safe_json_keys(item, root=False) for item in value)
+    return True
+
+
+def _is_string_list(value) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _is_valid_calendar_payload(value, payload_type: str) -> bool:
+    """Validate the complete persisted shape for day or summary pages."""
+    if not isinstance(value, dict) or not _has_safe_json_keys(value):
+        return False
+
+    if payload_type == "day":
+        required = {"summary", "digest", "sections", "diary", "all_keywords"}
+        if not required.issubset(value):
+            return False
+        if not all(isinstance(value[key], str) for key in ("summary", "digest", "diary")):
+            return False
+        if not _is_string_list(value["all_keywords"]):
+            return False
+        if not isinstance(value["sections"], list):
+            return False
+        section_keys = {"period", "title", "content", "keywords"}
+        for section in value["sections"]:
+            if not isinstance(section, dict) or not section_keys.issubset(section):
+                return False
+            if not all(isinstance(section[key], str) for key in ("period", "title", "content")):
+                return False
+            if not _is_string_list(section["keywords"]):
+                return False
+        return True
+
+    if payload_type == "summary":
+        required = {"summary", "digest", "sections", "highlights", "diary"}
+        if not required.issubset(value):
+            return False
+        if not all(isinstance(value[key], str) for key in ("summary", "digest", "diary")):
+            return False
+        if not _is_string_list(value["highlights"]):
+            return False
+        sections = value["sections"]
+        section_keys = {"emotion", "life", "growth"}
+        return (
+            isinstance(sections, dict)
+            and section_keys.issubset(sections)
+            and all(isinstance(sections[key], str) for key in section_keys)
+        )
+
+    return False
+
+
+def _parse_calendar_model_json(text: str, payload_type: str):
+    """Parse a complete calendar model object from common imperfect output."""
+    cleaned = _strip_json_wrapping(text)
+    if not cleaned:
+        return None
+
+    candidates = [cleaned]
+    candidates.extend(_iter_json_object_candidates(cleaned))
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        for attempt in (candidate, _escape_unescaped_json_content_quotes(candidate)):
+            try:
+                result = json.loads(attempt, strict=False)
+            except json.JSONDecodeError:
+                continue
+            if _is_valid_calendar_payload(result, payload_type):
+                if attempt != candidate:
+                    print("   🔧 JSON 内容引号兜底解析成功")
+                return result
+    return None
+
+
 async def generate_day_page(target_date: str = None, model_override: str = None):
     # Bug #7：防止同一日期并发生成日页面。与 run_daily_digest 共用 _digest_running，
     # 故用 daypage: 前缀的 key 区分，避免与每日整理互相误判为“正在进行”。
@@ -1213,33 +1441,21 @@ async def _generate_day_page_impl(target_date: str = None, model_override: str =
                 return {"date": date_str, "status": "error", "error": f"HTTP {response.status_code}"}
 
             data = parse_background_response(response.json(), use_api_format)
-            text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            choices = data.get("choices") or [{}]
+            choice = choices[0] if isinstance(choices[0], dict) else {}
+            message = choice.get("message") or {}
+            text = message.get("content") or ""
+            if choice.get("finish_reason") == "length":
+                usage = data.get("usage") or {}
+                print(
+                    "   ⚠️ 日页面模型输出达到 token 上限："
+                    f"finish_reason=length completion_tokens={usage.get('completion_tokens')} "
+                    f"text_chars={len(text)} max_tokens=6000"
+                )
+                return {"date": date_str, "status": "error", "error": "invalid format"}
 
-            # 清理 markdown 包裹
-            text = text.strip()
-            if text.startswith("```json"):
-                text = text[7:]
-            if text.startswith("```"):
-                text = text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-
-            # 解析 JSON
-            result = None
-            try:
-                result = json.loads(text)
-            except json.JSONDecodeError:
-                import re
-                match = re.search(r'\{.*\}', text, re.DOTALL)
-                if match:
-                    try:
-                        result = json.loads(match.group())
-                        print(f"   🔧 JSON 正则兜底解析成功")
-                    except json.JSONDecodeError:
-                        pass
-
-            if not result or not isinstance(result, dict):
+            result = _parse_calendar_model_json(text, "day")
+            if result is None:
                 print(f"   ⚠️ 日页面模型返回格式错误：{text[:200]}")
                 return {"date": date_str, "status": "error", "error": "invalid format"}
 
@@ -1483,8 +1699,11 @@ WEEK_SUMMARY_PROMPT = """你是用户的 AI 伴侣。请根据这一周的日页
 
 async def generate_week_summary(start: str, end: str, model_override: str = None):
     """从日页面生成周总结"""
+    from calendar_periods import validate_calendar_period_identity
     from database import get_calendar_range, save_calendar_page
     from config import get_config
+
+    validate_calendar_period_identity(start, "week", end_value=end)
 
     # 读取这一周的日页面
     day_pages = await get_calendar_range(start, end, "day")
@@ -1628,13 +1847,20 @@ async def generate_month_summary(start: str, end: str, month_str: str, model_ove
     missing（有素材但日页面缺失）。出现 missing 时延迟成文——月总结成文后
     扫描永久跳过，此时缺的日子会被固化为永久缺失，宁可等日页面补齐。
     """
+    from calendar_periods import filter_valid_calendar_period_pages, validate_calendar_period_identity
     from database import get_calendar_range, save_calendar_page, get_chat_messages_for_date
     from config import get_config
+
+    period = validate_calendar_period_identity(start, "month", end_value=end)
+    if month_str != period.start.strftime("%Y-%m"):
+        raise ValueError(f"month 必须与 start 对应：{period.start.strftime('%Y-%m')}")
 
     m_start = _coerce_date(start)
     m_end = _coerce_date(end)
 
-    week_pages = await get_calendar_range(start, end, "week")
+    week_pages = filter_valid_calendar_period_pages(
+        await get_calendar_range(start, end, "week"), "week"
+    )
     full_weeks = [
         p for p in week_pages
         if _coerce_date(p["date"]) + timedelta(days=6) <= m_end
@@ -1750,16 +1976,24 @@ PERIOD_SUMMARY_PROMPT = """你是用户的 AI 伴侣。请根据下面的{source
 async def generate_period_summary(start: str, end: str, period_type: str,
                                    label: str, source_type: str, model_override: str = None):
     """通用的季度/年度总结生成"""
+    from calendar_periods import filter_valid_calendar_period_pages, validate_calendar_period_identity
     from database import get_calendar_range, save_calendar_page
     from config import get_config
 
+    if period_type not in {"quarter", "year"}:
+        raise ValueError("generate_period_summary 只允许 quarter/year")
+    validate_calendar_period_identity(start, period_type, end_value=end)
+
     # 根据 source_type 决定读取什么
     if source_type == "月总结":
-        pages = await get_calendar_range(start, end, "month")
+        source_page_type = "month"
     elif source_type == "季度总结":
-        pages = await get_calendar_range(start, end, "quarter")
+        source_page_type = "quarter"
     else:
-        pages = await get_calendar_range(start, end, "week")
+        source_page_type = "week"
+    pages = filter_valid_calendar_period_pages(
+        await get_calendar_range(start, end, source_page_type), source_page_type
+    )
 
     if not pages:
         print(f"   📭 {label} 没有{source_type}数据，跳过")
@@ -1861,30 +2095,11 @@ async def _call_model_for_json(prompt: str, user_msg: str, model: str, max_token
                     f"text_chars={len(text)} max_tokens={max_tokens}"
                 )
                 return None
-            text = text.strip()
-            if text.startswith("```json"):
-                text = text[7:]
-            if text.startswith("```"):
-                text = text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-
-            parsed = None
-            try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError:
-                import re
-                match = re.search(r'\{.*\}', text, re.DOTALL)
-                if match:
-                    try:
-                        parsed = json.loads(match.group())
-                    except json.JSONDecodeError:
-                        pass
-            if parsed is None:
+            result = _parse_calendar_model_json(text, "summary")
+            if result is None:
                 print(f"   ⚠️ JSON 解析失败：{text[:200]}")
                 return None
-            prepared, voice_errors = prepare_generated_context(parsed)
+            prepared, voice_errors = prepare_generated_context(result)
             if voice_errors:
                 print(f"   🚫 日历摘要违反身份叙述契约，未保存: {voice_errors}")
                 return None

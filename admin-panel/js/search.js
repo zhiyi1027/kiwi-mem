@@ -1,5 +1,5 @@
 // ============================================================
-// search.js — 顶栏全局参数搜索（v1.6.1 新增）
+// search.js — 顶栏全局参数搜索（v1.6.1 新增，当前 v1.6.2）
 //
 // 索引：所有配置项（中文标签 / key / 描述）+ 页面名。
 // 选中参数 → 跳到所在功能页（必要时自动切到「参数」tab）→
@@ -108,7 +108,7 @@ export function initSearch(container) {
   container.innerHTML = `
     <div class="gs-box">
       <span class="gs-icon">⌕</span>
-      <input type="search" class="gs-input" id="gs-input" placeholder="搜索参数、页面…  例：半衰期 / 提示词" autocomplete="off" spellcheck="false">
+      <input type="search" class="gs-input" id="gs-input" placeholder="搜索参数、页面、操作…  例：半衰期 / 提示词 / dream" autocomplete="off" spellcheck="false">
       <div class="gs-drop" id="gs-drop" hidden></div>
     </div>`;
   const input = container.querySelector('#gs-input');

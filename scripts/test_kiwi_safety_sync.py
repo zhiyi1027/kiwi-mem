@@ -482,16 +482,17 @@ async def test_s3() -> None:
     await _pool_execute(
         """
         INSERT INTO calendar_pages (date, type, digest, summary)
-        VALUES ('2026-01-01', 'year', 'year', 'year'),
+        VALUES ('2025-01-01', 'year', 'year', 'year'),
+               ('2025-07-16', 'day', 'year-source', 'year-source'),
                ('2026-07-01', 'quarter', 'quarter', 'quarter'),
                ('2026-07-01', 'month', 'month', 'month')
         """
     )
     tz_calls.clear()
     with patch.object(database, "datetime", FixedDateTime):
-        hierarchical = await database.get_calendar_for_injection(lookback_days=365)
+        hierarchical = await database.get_calendar_for_injection(lookback_days=800)
     require(tz_calls == [database.TZ_CST], f"hierarchy path did not request TZ_CST: {tz_calls}")
-    require(any(item.get("label") == "2026年总结" for item in hierarchical), "date_cls hierarchy path broke")
+    require(any(item.get("label") == "2025年总结" for item in hierarchical), "date_cls hierarchy path broke")
     source = inspect.getsource(database.get_calendar_for_injection)
     require("datetime.now(TZ_CST).date()" in source, "CST anchor missing")
     require("date_cls.today()" not in source, "local container date anchor remains")
@@ -909,6 +910,253 @@ async def test_s6(client: httpx.AsyncClient) -> None:
     await database.update_dream_log(control_dream, status="completed", dream_narrative="control-updated")
     require(await _pool_fetchval("SELECT status FROM dream_logs WHERE id=$1", control_dream) == "completed", "active Dream update regressed")
     passed("T-S6-8 row-lock interleaving blocks late lifecycle writes; active control updates")
+
+
+async def test_w1_06() -> None:
+    print("\nW1-06 calendar page/comment delete atomicity")
+    await _truncate("calendar_pages", "comments")
+
+    target_id = await _pool_fetchval(
+        "INSERT INTO calendar_pages (date, type) VALUES ('2026-07-18', 'day') RETURNING id"
+    )
+    target_comment = await _pool_fetchval(
+        """
+        INSERT INTO comments (target_type, target_id, content)
+        VALUES ('calendar_page', $1, 'target') RETURNING id
+        """,
+        target_id,
+    )
+    await _pool_execute(
+        """
+        INSERT INTO comments (target_type, target_id, parent_id, content)
+        VALUES ('calendar_page', $1, $2, 'reply')
+        """,
+        target_id,
+        target_comment,
+    )
+
+    await _pool_execute(
+        """
+        CREATE OR REPLACE FUNCTION w1_06_fail_calendar_delete()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            RAISE EXCEPTION 'forced W1-06 page delete failure';
+        END;
+        $$
+        """
+    )
+    await _pool_execute(
+        """
+        CREATE TRIGGER w1_06_fail_calendar_delete_trigger
+        BEFORE DELETE ON calendar_pages
+        FOR EACH ROW WHEN (OLD.date = DATE '2026-07-18')
+        EXECUTE FUNCTION w1_06_fail_calendar_delete()
+        """
+    )
+    try:
+        try:
+            await database.delete_calendar_page("2026-07-18", "day")
+        except asyncpg.PostgresError:
+            pass
+        else:
+            raise AssertionError("forced page delete failure did not escape")
+        require(
+            await _pool_fetchval("SELECT COUNT(*) FROM calendar_pages WHERE id=$1", target_id) == 1,
+            "failed deletion removed the calendar page",
+        )
+        require(
+            await _pool_fetchval(
+                "SELECT COUNT(*) FROM comments WHERE target_type='calendar_page' AND target_id=$1",
+                target_id,
+            ) == 2,
+            "failed deletion did not restore calendar comments",
+        )
+    finally:
+        await _pool_execute("DROP TRIGGER IF EXISTS w1_06_fail_calendar_delete_trigger ON calendar_pages")
+        await _pool_execute("DROP FUNCTION IF EXISTS w1_06_fail_calendar_delete()")
+    passed("T-W1-06-1 injected second-step failure preserves page and comments")
+
+    keep_page_id = await _pool_fetchval(
+        "INSERT INTO calendar_pages (date, type) VALUES ('2026-07-19', 'day') RETURNING id"
+    )
+    keep_comment_id = await _pool_fetchval(
+        """
+        INSERT INTO comments (target_type, target_id, content)
+        VALUES ('calendar_page', $1, 'keep-page') RETURNING id
+        """,
+        keep_page_id,
+    )
+    other_target_id = await _pool_fetchval(
+        """
+        INSERT INTO comments (target_type, target_id, content)
+        VALUES ('memory', $1, 'keep-type') RETURNING id
+        """,
+        target_id,
+    )
+
+    require(await database.delete_calendar_page("2026-07-18", "day"), "existing page was not deleted")
+    require(
+        await _pool_fetchval("SELECT COUNT(*) FROM calendar_pages WHERE id=$1", target_id) == 0,
+        "target page survived successful delete",
+    )
+    require(
+        await _pool_fetchval(
+            "SELECT COUNT(*) FROM comments WHERE target_type='calendar_page' AND target_id=$1",
+            target_id,
+        ) == 0,
+        "target comments/replies survived successful delete",
+    )
+    passed("T-W1-06-2 successful delete removes page and its comment tree")
+
+    require(
+        await _pool_fetchval("SELECT COUNT(*) FROM comments WHERE id=$1", keep_comment_id) == 1,
+        "another page's comment was deleted",
+    )
+    require(
+        await _pool_fetchval("SELECT COUNT(*) FROM comments WHERE id=$1", other_target_id) == 1,
+        "another target type with the same numeric id was deleted",
+    )
+    passed("T-W1-06-3 unrelated comments remain untouched")
+
+    require(
+        not await database.delete_calendar_page("2026-07-18", "day"),
+        "repeated delete did not report not_found",
+    )
+    passed("T-W1-06-4 repeated delete is idempotent")
+
+
+async def test_w1_08() -> None:
+    print("\nW1-08 calendar period identity and legacy isolation")
+    import importlib
+
+    periods = importlib.import_module("calendar_periods")
+    today = StdDateTime.now(database.TZ_CST).date()
+    current_monday = today - timedelta(days=today.weekday())
+    previous_week_end = current_monday - timedelta(days=1)
+    previous_week_start = previous_week_end - timedelta(days=6)
+    previous_month_end = today.replace(day=1) - timedelta(days=1)
+    previous_month_start = previous_month_end.replace(day=1)
+
+    await _truncate("calendar_pages", "comments")
+    invalid_factories = (
+        lambda: database.save_calendar_page(today.replace(day=1).isoformat(), "month", []),
+        lambda: database.save_calendar_page((previous_week_start + timedelta(days=1)).isoformat(), "week", []),
+        lambda: database.save_calendar_page(previous_week_start.isoformat(), "fortnight", []),
+        lambda: database.update_calendar_page_user_edit(today.replace(day=1).isoformat(), "month", diary="bad"),
+    )
+    for make_awaitable in invalid_factories:
+        try:
+            await make_awaitable()
+        except periods.CalendarPeriodValidationError:
+            pass
+        else:
+            raise AssertionError("invalid/incomplete calendar identity crossed the DB write boundary")
+    require(
+        await _pool_fetchval("SELECT COUNT(*) FROM calendar_pages") == 0,
+        "rejected calendar identities left rows behind",
+    )
+    passed("T-W1-08-1 DB writes reject unknown, misanchored, and incomplete periods")
+
+    await database.save_calendar_page(today.isoformat(), "day", [])
+    await database.save_calendar_page(previous_week_start.isoformat(), "week", [])
+    await database.update_calendar_page_user_edit(
+        previous_month_start.isoformat(), "month", diary="valid manual summary"
+    )
+    require(
+        await _pool_fetchval("SELECT COUNT(*) FROM calendar_pages") == 3,
+        "valid day/completed summaries did not remain writable",
+    )
+    passed("T-W1-08-2 valid day and completed canonical periods remain writable")
+
+    await _truncate("calendar_pages", "comments")
+    bad_week_date = previous_week_start - timedelta(days=13)  # Tuesday, safely older than seven days.
+    bad_month_date = previous_month_start + timedelta(days=1)
+    bad_week_id = await _pool_fetchval(
+        "INSERT INTO calendar_pages (date, type, digest) VALUES ($1, 'week', 'BAD_WEEK') RETURNING id",
+        bad_week_date,
+    )
+    bad_month_id = await _pool_fetchval(
+        "INSERT INTO calendar_pages (date, type, digest) VALUES ($1, 'month', 'BAD_MONTH') RETURNING id",
+        bad_month_date,
+    )
+    bad_type_id = await _pool_fetchval(
+        "INSERT INTO calendar_pages (date, type, digest) VALUES ($1, 'fortnight', 'BAD_TYPE') RETURNING id",
+        previous_month_start,
+    )
+    premature_created_at = StdDateTime(
+        previous_week_end.year, previous_week_end.month, previous_week_end.day,
+        12, 0, tzinfo=database.TZ_CST,
+    )
+    premature_week_id = await _pool_fetchval(
+        """
+        INSERT INTO calendar_pages (date, type, digest, created_at, updated_at)
+        VALUES ($1, 'week', 'PREMATURE_WEEK', $2, $2) RETURNING id
+        """,
+        previous_week_start,
+        premature_created_at,
+    )
+    source_dates = {bad_week_date, bad_month_date, previous_week_start}
+    for index, source_date in enumerate(sorted(source_dates), start=1):
+        await _pool_execute(
+            """
+            INSERT INTO calendar_pages (date, type, digest)
+            VALUES ($1, 'day', $2)
+            ON CONFLICT (date, type) DO UPDATE SET digest=EXCLUDED.digest
+            """,
+            source_date,
+            f"GOOD_DAY_{index}",
+        )
+
+    count_before = await _pool_fetchval("SELECT COUNT(*) FROM calendar_pages")
+    audited = await database.get_invalid_calendar_period_pages()
+    count_after = await _pool_fetchval("SELECT COUNT(*) FROM calendar_pages")
+    require(count_before == count_after, "legacy period audit mutated stored pages")
+    audited_ids = {row["id"] for row in audited}
+    require(
+        {bad_week_id, bad_month_id, bad_type_id, premature_week_id} <= audited_ids,
+        f"legacy audit missed invalid identities: {audited_ids}",
+    )
+    passed("T-W1-08-3 read-only audit diagnoses legacy invalid pages without mutation")
+
+    injected = await database.get_calendar_for_injection(lookback_days=400)
+    require(
+        not any(row["type"] in {"week", "month", "fortnight"} for row in injected),
+        "invalid legacy summaries entered injection or claimed coverage",
+    )
+    injected_digests = {row.get("digest") for row in injected}
+    expected_day_digests = {f"GOOD_DAY_{i}" for i in range(1, len(source_dates) + 1)}
+    require(
+        expected_day_digests <= injected_digests,
+        f"invalid summaries hid their source days: {injected_digests}",
+    )
+    passed("T-W1-08-4 invalid legacy summaries cannot inject or claim day coverage")
+
+    for source_date in source_dates:
+        require(
+            await _pool_fetchval(
+                "SELECT COUNT(*) FROM calendar_pages WHERE date=$1 AND type='day'", source_date
+            ) == 1,
+            "legacy isolation moved or deleted a source day",
+        )
+    passed("T-W1-08-5 legacy isolation preserves original rows for explicit rebuild")
+
+    await database.save_calendar_page(
+        previous_week_start.isoformat(), "week", [], digest="REBUILT_WEEK"
+    )
+    rebuilt = await _pool_fetchrow(
+        "SELECT created_at, digest FROM calendar_pages WHERE id=$1", premature_week_id
+    )
+    require(
+        rebuilt["created_at"].astimezone(database.TZ_CST).date() > previous_week_end
+        and rebuilt["digest"] == "REBUILT_WEEK",
+        "explicit regeneration did not refresh the quarantined authorship epoch",
+    )
+    audited_after_rebuild = await database.get_invalid_calendar_period_pages()
+    require(
+        premature_week_id not in {row["id"] for row in audited_after_rebuild},
+        "explicit canonical rebuild did not restore period eligibility",
+    )
+    passed("T-W1-08-6 explicit regeneration releases premature-page quarantine")
 
 
 async def test_w1_01() -> None:
@@ -2051,6 +2299,218 @@ async def test_autobiographical_pipelines() -> None:
     passed("T-P0-ID-8 profile keeps old data on identity failure and normalizes 知知/她 on success")
 
 
+async def test_w2_01(client: httpx.AsyncClient) -> None:
+    """W2-01 G1 granular-sync, ownership, gate, and observability guards."""
+    expected_routes = {
+        ("/sync/conversations", "POST"),
+        ("/sync/conversations/{conv_id}", "PATCH"),
+        ("/sync/conversations/{conv_id}/messages/{msg_id}", "PUT"),
+        ("/sync/conversations/{conv_id}/messages/{msg_id}", "DELETE"),
+        ("/sync/projects", "POST"),
+        ("/sync/projects/{proj_id}", "PATCH"),
+    }
+    actual_routes = {
+        (route.path, method)
+        for route in app_module.app.routes
+        for method in (getattr(route, "methods", None) or set())
+    }
+    missing = sorted(expected_routes - actual_routes)
+    require(not missing, f"W2-01 granular routes missing: {missing}")
+    require(
+        config.CONFIG_SCHEMA.get("sync_legacy_write_enabled", (None, None))[1] == "true",
+        "sync_legacy_write_enabled must exist and default to true",
+    )
+
+    await _truncate("chat_messages", "chat_conversations", "chat_projects")
+    prefix = "w201-"
+    proj_a, proj_b = f"{prefix}pa", f"{prefix}pb"
+    conv_a, conv_b = f"{prefix}ca", f"{prefix}cb"
+
+    # Create-only project endpoints use server timestamps and never overwrite on replay.
+    response = await client.post(
+        "/sync/projects",
+        json={"id": proj_a, "name": "Project A", "icon": "A", "createdAt": "2000-01-01T00:00:00Z"},
+    )
+    require(response.status_code == 200, f"project POST failed: {response.status_code} {response.text}")
+    response = await client.post("/sync/projects", json={"id": proj_a, "name": "overwritten"})
+    require(response.status_code == 409, "duplicate project POST must return 409")
+    project_row = await _pool_fetchrow(
+        "SELECT name, icon, created_at FROM chat_projects WHERE id = $1", proj_a
+    )
+    require(project_row["name"] == "Project A" and project_row["icon"] == "A", "project replay overwrote data")
+    require(project_row["created_at"].year >= 2026, "project POST trusted client createdAt")
+    passed("T-W2-01-1 project POST is create-only and server-timed")
+
+    response = await client.patch(f"/sync/projects/{proj_a}", json={"icon": "PATCHED"})
+    require(response.status_code == 200, "project PATCH failed")
+    response = await client.patch(f"/sync/projects/{proj_a}", json={"unknown": "x"})
+    require(response.status_code == 400, "empty/unknown project PATCH must return 400")
+    response = await client.patch(f"/sync/projects/{prefix}missing", json={"name": "x"})
+    require(response.status_code == 404, "missing project PATCH must return 404")
+    project_row = await _pool_fetchrow("SELECT name, icon FROM chat_projects WHERE id = $1", proj_a)
+    require(project_row["name"] == "Project A" and project_row["icon"] == "PATCHED", "project PATCH was not partial")
+    passed("T-W2-01-2 project PATCH is partial and never creates")
+
+    await client.post("/sync/projects", json={"id": proj_b, "name": "Project B"})
+    response = await client.post(
+        "/sync/conversations",
+        json={
+            "id": conv_a,
+            "title": "Conversation A",
+            "projectId": proj_a,
+            "createdAt": "2000-01-01T00:00:00Z",
+            "messages": [{"id": f"{prefix}ignored", "content": "must-not-insert"}],
+        },
+    )
+    require(response.status_code == 200 and response.json().get("warning") == "messages ignored", "conversation POST contract failed")
+    response = await client.post("/sync/conversations", json={"id": conv_a, "title": "overwritten"})
+    require(response.status_code == 409, "duplicate conversation POST must return 409")
+    conv_row = await _pool_fetchrow(
+        "SELECT title, project_id, created_at FROM chat_conversations WHERE id = $1", conv_a
+    )
+    require(conv_row["title"] == "Conversation A" and conv_row["project_id"] == proj_a, "conversation replay overwrote data")
+    require(conv_row["created_at"].year >= 2026, "conversation POST trusted client createdAt")
+    require(await _pool_fetchval("SELECT COUNT(*) FROM chat_messages WHERE conversation_id = $1", conv_a) == 0, "POST inserted messages")
+    passed("T-W2-01-3 conversation POST is metadata-only, create-only, and server-timed")
+
+    response = await client.patch(f"/sync/conversations/{conv_a}", json={"pinned": True})
+    require(response.status_code == 200, "conversation PATCH failed")
+    response = await client.patch(f"/sync/conversations/{conv_a}", json={"messages": []})
+    require(response.status_code == 400, "messages-only conversation PATCH must return 400")
+    response = await client.patch(f"/sync/conversations/{prefix}missing", json={"title": "x"})
+    require(response.status_code == 404, "missing conversation PATCH must return 404")
+    conv_row = await _pool_fetchrow("SELECT title, pinned FROM chat_conversations WHERE id = $1", conv_a)
+    require(conv_row["title"] == "Conversation A" and conv_row["pinned"] is True, "conversation PATCH was not partial")
+    passed("T-W2-01-4 conversation PATCH is partial and never creates")
+
+    msg_id = f"{prefix}message"
+    message_url = f"/sync/conversations/{conv_a}/messages/{msg_id}"
+    response = await client.put(message_url, json={"id": "body-id-ignored", "role": "user", "content": "v1", "sortOrder": 7})
+    require(response.status_code == 200, "single-message insert failed")
+    before_touch = await _pool_fetchval("SELECT updated_at FROM chat_conversations WHERE id = $1", conv_a)
+    await asyncio.sleep(0.01)
+    response = await client.put(message_url, json={"role": "assistant", "content": "v2"})
+    require(response.status_code == 200, "same-ID message replay failed")
+    message_row = await _pool_fetchrow(
+        "SELECT id, conversation_id, role, content, sort_order FROM chat_messages WHERE id = $1", msg_id
+    )
+    after_touch = await _pool_fetchval("SELECT updated_at FROM chat_conversations WHERE id = $1", conv_a)
+    require(message_row["id"] == msg_id and message_row["conversation_id"] == conv_a, "URL IDs were not authoritative")
+    require(message_row["role"] == "assistant" and message_row["content"] == "v2", "message replay did not update snapshot")
+    require(message_row["sort_order"] == 7 and after_touch > before_touch, "sort order/timestamp replay contract failed")
+    require(await _pool_fetchval("SELECT COUNT(*) FROM chat_messages WHERE id = $1", msg_id) == 1, "message replay created duplicates")
+    passed("T-W2-01-5 same message ID replay is idempotent and URL-authoritative")
+
+    await client.post("/sync/conversations", json={"id": conv_b, "title": "Conversation B", "projectId": proj_b})
+    original = dict(await _pool_fetchrow("SELECT * FROM chat_messages WHERE id = $1", msg_id))
+    response = await client.put(
+        f"/sync/conversations/{conv_b}/messages/{msg_id}",
+        json={"role": "assistant", "content": "forged-cross-project"},
+    )
+    require(response.status_code == 409, "cross-project/cross-conversation message forgery must return 409")
+    require(dict(await _pool_fetchrow("SELECT * FROM chat_messages WHERE id = $1", msg_id)) == original, "409 changed original message")
+    passed("T-W2-01-6 cross-conversation and cross-project message forgery is rejected")
+
+    concurrent_id = f"{prefix}concurrent"
+    responses = await asyncio.gather(
+        client.put(f"/sync/conversations/{conv_a}/messages/{concurrent_id}", json={"content": "from-a"}),
+        client.put(f"/sync/conversations/{conv_b}/messages/{concurrent_id}", json={"content": "from-b"}),
+    )
+    require(sorted(r.status_code for r in responses) == [200, 409], "concurrent cross-owner writes must yield one 200 and one 409")
+    winner = conv_a if responses[0].status_code == 200 else conv_b
+    require(await _pool_fetchval("SELECT conversation_id FROM chat_messages WHERE id = $1", concurrent_id) == winner, "concurrent winner ownership changed")
+    passed("T-W2-01-7 concurrent same-ID cross-owner writes have exactly one winner")
+
+    response = await client.delete(f"/sync/conversations/{conv_b}/messages/{msg_id}")
+    require(response.status_code == 200 and response.json() == {"deleted": False}, "wrong-owner delete was not rejected")
+    response = await client.delete(message_url)
+    require(response.status_code == 200 and response.json() == {"deleted": True}, "correct-owner delete failed")
+    response = await client.delete(message_url)
+    require(response.status_code == 200 and response.json() == {"deleted": False}, "repeat delete was not idempotent")
+    passed("T-W2-01-8 single-message delete is owner-scoped and idempotent")
+
+    atomic_conv, atomic_msg = f"{prefix}atomic-conv", f"{prefix}atomic-msg"
+    await client.post("/sync/conversations", json={"id": atomic_conv, "title": "atomic"})
+    await _pool_execute(
+        """
+        CREATE OR REPLACE FUNCTION w201_fail_parent_touch() RETURNS trigger AS $fn$
+        BEGIN
+            IF NEW.id = 'w201-atomic-conv' THEN RAISE EXCEPTION 'W2-01 injected parent-touch failure'; END IF;
+            RETURN NEW;
+        END; $fn$ LANGUAGE plpgsql
+        """
+    )
+    await _pool_execute(
+        "CREATE TRIGGER w201_fail_parent_touch_trg BEFORE UPDATE ON chat_conversations "
+        "FOR EACH ROW EXECUTE FUNCTION w201_fail_parent_touch()"
+    )
+    try:
+        response = await client.put(
+            f"/sync/conversations/{atomic_conv}/messages/{atomic_msg}", json={"content": "must-roll-back"}
+        )
+        require(response.status_code == 500, "injected transaction failure must surface as 500")
+        require(
+            not await _pool_fetchval("SELECT EXISTS(SELECT 1 FROM chat_messages WHERE id = $1)", atomic_msg),
+            "message half-state survived parent-touch failure",
+        )
+    finally:
+        await _pool_execute("DROP TRIGGER IF EXISTS w201_fail_parent_touch_trg ON chat_conversations")
+        await _pool_execute("DROP FUNCTION IF EXISTS w201_fail_parent_touch()")
+    passed("T-W2-01-9 message write and parent timestamp are one transaction")
+
+    legacy_conv, legacy_proj = f"{prefix}legacy-conv", f"{prefix}legacy-proj"
+    sentinel = "W2_01_PAYLOAD_MUST_STAY_PRIVATE"
+    gate_key = "sync_legacy_write_enabled"
+    gate_had_row = await _pool_fetchval("SELECT EXISTS(SELECT 1 FROM gateway_config WHERE key = $1)", gate_key)
+    gate_previous = await _config_row(gate_key)
+    try:
+        require(await config.get_config_bool(gate_key, True) is True, "legacy gate is not open by default")
+        capture = io.StringIO()
+        with redirect_stdout(capture):
+            response_conv_open = await client.put(
+                f"/sync/conversations/{legacy_conv}",
+                json={"title": sentinel, "messages": [{"id": f"{prefix}legacy-msg", "content": sentinel}]},
+            )
+            response_proj_open = await client.put(
+                f"/sync/projects/{legacy_proj}", json={"name": sentinel, "description": sentinel}
+            )
+        require(response_conv_open.status_code == 200 and response_proj_open.status_code == 200, "default-open legacy PUT failed")
+        require(await _pool_fetchval("SELECT content FROM chat_messages WHERE id = $1", f"{prefix}legacy-msg") == sentinel, "old conversation payload broke")
+        passed("T-W2-01-10 default-open legacy PUTs preserve old-client payloads")
+
+        await _upsert_config(gate_key, "false")
+        blocked_capture = io.StringIO()
+        with redirect_stdout(blocked_capture):
+            response_conv_closed = await client.put(f"/sync/conversations/{legacy_conv}", json={"title": sentinel})
+            response_proj_closed = await client.put(f"/sync/projects/{legacy_proj}", json={"name": sentinel})
+        require(response_conv_closed.status_code == 410 and response_proj_closed.status_code == 410, "closed gate did not retire both legacy PUTs")
+        import_response = await client.post("/sync/import", json={"conversations": [], "projects": []})
+        require(import_response.status_code == 200 and import_response.json().get("status") == "ok", "/sync/import was incorrectly gated")
+        fresh_response = await client.post("/sync/projects", json={"id": f"{prefix}gate-fresh", "name": "fresh"})
+        require(fresh_response.status_code == 200, "new granular endpoint was incorrectly gated")
+        passed("T-W2-01-11 closed gate affects only two legacy PUTs; import stays W2-02")
+
+        events = capture.getvalue() + blocked_capture.getvalue()
+        expected_events = {
+            "event=sync_legacy_write endpoint=conversation_put outcome=allowed increment=1",
+            "event=sync_legacy_write endpoint=project_put outcome=allowed increment=1",
+            "event=sync_legacy_write endpoint=conversation_put outcome=blocked increment=1",
+            "event=sync_legacy_write endpoint=project_put outcome=blocked increment=1",
+        }
+        actual_events = {line.strip() for line in events.splitlines() if line.startswith("event=sync_legacy_write ")}
+        require(actual_events == expected_events, f"legacy counter events mismatch: {sorted(actual_events)}")
+        require(sentinel not in events and legacy_conv not in events and legacy_proj not in events, "legacy observability leaked payload or entity IDs")
+        passed("T-W2-01-12 legacy structured count events contain no payload or entity IDs")
+    finally:
+        if gate_had_row:
+            await _upsert_config(gate_key, gate_previous)
+        else:
+            await _pool_execute("DELETE FROM gateway_config WHERE key = $1", gate_key)
+
+    malformed = await client.post("/sync/conversations", content=b"[1,2,3]", headers={"content-type": "application/json"})
+    require(malformed.status_code == 400, "new JSON-object endpoint accepted an array body")
+
+
 async def run_suite(test_dsn: str) -> None:
     global database, config, app_module, memory_extractor
 
@@ -2105,12 +2565,15 @@ async def run_suite(test_dsn: str) -> None:
         await test_s4(client)
         await test_s5(client)
         await test_s6(client)
+        await test_w1_06()
+        await test_w1_08()
         await test_w1_01()
         await test_continuity_profile(client)
         await test_control_plane_auth(client)
         await test_shared_identity_api(client)
         await test_complete_chat_archive(client)
         await test_autobiographical_pipelines()
+        await test_w2_01(client)
 
 
 async def async_main() -> int:
@@ -2130,6 +2593,9 @@ async def async_main() -> int:
             raise
         legacy_passed = [name for name in PASSED if name.startswith("T-S")]
         w1_01_passed = [name for name in PASSED if name.startswith("T-W1-01-")]
+        w1_06_passed = [name for name in PASSED if name.startswith("T-W1-06-")]
+        w1_08_passed = [name for name in PASSED if name.startswith("T-W1-08-")]
+        w2_01_passed = [name for name in PASSED if name.startswith("T-W2-01-")]
         continuity_passed = [name for name in PASSED if name.startswith("T-CONT-")]
         identity_passed = [name for name in PASSED if name.startswith("T-ID-")]
         p0_identity_passed = [name for name in PASSED if name.startswith("T-P0-ID-")]
@@ -2137,6 +2603,9 @@ async def async_main() -> int:
         auth_passed = [name for name in PASSED if name.startswith("T-AUTH-")]
         print(f"\nPASS: {len(legacy_passed)} permanent S1-S6 behavior guards")
         print(f"PASS: {len(w1_01_passed)} W1-01 isolation/permanent guards")
+        print(f"PASS: {len(w1_06_passed)} W1-06 calendar-delete atomicity guards")
+        print(f"PASS: {len(w1_08_passed)} W1-08 calendar-period guards")
+        print(f"PASS: {len(w2_01_passed)} W2-01 granular-sync guards")
         print(f"PASS: {len(continuity_passed)} continuity/no-forgetting guards")
         print(f"PASS: {len(identity_passed)} shared-identity API guards")
         print(f"PASS: {len(p0_identity_passed)} autobiographical pipeline guards")

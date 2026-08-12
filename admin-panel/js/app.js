@@ -1,5 +1,5 @@
 // ============================================================
-// app.js — 应用外壳：侧栏 / 路由 / 主题 / 移动端（v1.6.1 改版）
+// app.js — 应用外壳：侧栏 / 路由 / 主题 / 移动端（v1.6.2）
 // 哈希路由 #/<key> → 懒加载 js/pages/<key>.js，调用 default.mount(root)
 //
 // 本次改版：
@@ -134,7 +134,8 @@ async function refreshShellStatus() {
   try {
     const status = await get('/');
     if (pill) {
-      pill.textContent = status.version ? '● ' + status.version : '● 运行中';
+      // 版本号在侧栏底部已经有一份，顶栏胶囊只说「通不通」，不重复显示版本。
+      pill.textContent = '● 运行中';
       pill.className = 'badge badge-accent';
     }
     if (foot && status.version) foot.textContent = status.version;
